@@ -1,0 +1,31 @@
+[package]
+name = "browsegoo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A barebones Web browser built around the Servo engine, using GTK4."
+homepage = "https://www.aisloperator.com/"
+publish = false
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+servo = { version = "0.8.0", default-features = false, features = ["bundled", "js_jit"] }
+
+# These appear in Servo's public API, and are already dependencies of Servo.
+dpi = "0.1"
+euclid = "0.22"
+url = "2"
+
+# Keep memory use practical when compiling Servo's enormous crates.
+[profile.dev]
+debug = false
+incremental = false
+opt-level = 1
+
+# Servo's biggest crate needs more memory to compile than the rest put together.
+[profile.dev.package.servo-script]
+opt-level = 0
+
+[profile.release]
+debug = false
