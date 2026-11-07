@@ -39,16 +39,17 @@ the development files for GTK4. On Debian or Ubuntu, that is:
 
 Then:
 
-    cargo run -- https://servo.org/
+    cargo build --release
+    ./target/release/browsegoo https://servo.org/
 
-The first build compiles about 550 crates, and takes a while. It also downloads
-a prebuilt SpiderMonkey library, the JavaScript engine used by Servo.
+The first build compiles about 550 crates, which took about 18 minutes on 2 CPU
+cores. It also downloads a prebuilt SpiderMonkey library, the JavaScript engine
+used by Servo.
 
-Compiling Servo takes a lot of memory. The default profile in `Cargo.toml` is set
-up to be practical, and has been built on 2 CPU cores and 4 GB of RAM, with no
-swap, by using `cargo build -j1` for the last part of the build. If `rustc` gets
-killed while compiling `servo-script`, that's why. A `--release` build should
-run faster, but needs considerably more memory, and hasn't been tried yet.
+Compiling Servo takes a lot of memory. A release build used about 5 GB in total,
+and worked with 8 GB of RAM. With only 4 GB, use the default profile and one job
+at a time, with `cargo build -j1`, which is set up to use less. If `rustc` gets
+killed while compiling `servo-script`, it ran out of memory.
 
 At run time, Servo needs a software OpenGL driver through EGL. On Debian and
 Ubuntu, that's in `libegl1` and `libgl1-mesa-dri`, which most desktops already have.
