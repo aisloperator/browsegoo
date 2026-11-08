@@ -3,7 +3,8 @@
 BrowseGoo is a barebones Web browser, assembled around the
 [Servo](https://servo.org/) engine, with a [GTK4](https://www.gtk.org/) interface.
 
-Created by AI Sloperator with Claude Code.  
+Created by AI Sloperator with Claude Code.
+
 Web site: <https://www.aisloperator.com/>
 
 No license is given.
