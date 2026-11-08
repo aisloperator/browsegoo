@@ -36,6 +36,7 @@ use url::Url;
 
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
+use crate::closing;
 use crate::filter::{self, Engine, ResourceType};
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
@@ -1300,7 +1301,7 @@ impl Browser {
     }
 
     fn show_about(&self) {
-        gtk::AboutDialog::builder()
+        let about = gtk::AboutDialog::builder()
             .transient_for(&self.widgets.window)
             .modal(true)
             .program_name("BrowseGoo")
@@ -1311,8 +1312,9 @@ impl Browser {
             .authors(["AI Sloperator with Claude Code"])
             .license_type(gtk::License::Custom)
             .license(LICENSE_STATEMENT)
-            .build()
-            .present();
+            .build();
+        closing::add_close_keys(&about);
+        about.present();
     }
 }
 

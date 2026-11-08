@@ -7,6 +7,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::bookmarks::Bookmark;
+use crate::closing;
 use crate::location::parse_location;
 
 /// A change to the bookmarks, which the browser makes and saves.
@@ -115,8 +116,6 @@ impl BookmarksEditor {
         let delete = gtk::Button::builder()
             .label("Delete")
             .css_classes(["destructive-action"])
-            .hexpand(true)
-            .halign(gtk::Align::End)
             .build();
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         buttons.append(&add);
@@ -145,6 +144,11 @@ impl BookmarksEditor {
             .hide_on_close(true)
             .child(&content)
             .build();
+        closing::add_close_keys(&window);
+        let close = closing::close_button(&window);
+        close.set_hexpand(true);
+        close.set_halign(gtk::Align::End);
+        buttons.append(&close);
 
         let editor = Rc::new(Self {
             window,
@@ -210,6 +214,17 @@ impl BookmarksEditor {
             });
             entry.add_controller(focus);
         }
+
+        // Closing keeps a change being typed, as leaving its field would, and
+        // otherwise drops it, so it isn't still there when the window reopens.
+        let editor = Rc::downgrade(self);
+        self.window.connect_close_request(move |_| {
+            if let Some(editor) = editor.upgrade() {
+                editor.save_fields();
+                editor.load(editor.editing.get());
+            }
+            glib::Propagation::Proceed
+        });
 
         let editor = Rc::downgrade(self);
         self.add.connect_clicked(move |_| {

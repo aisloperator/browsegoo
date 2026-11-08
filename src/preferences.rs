@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::closing;
 use crate::filter_lists::{LISTS, ListStatus, Settings};
 
 pub struct ListRow {
@@ -102,6 +103,11 @@ impl PreferencesWindow {
             .hide_on_close(true)
             .child(&content)
             .build();
+        closing::add_close_keys(&window);
+        let close = closing::close_button(&window);
+        close.set_halign(gtk::Align::End);
+        close.set_margin_top(6);
+        content.append(&close);
 
         Self {
             window,

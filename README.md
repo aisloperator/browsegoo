@@ -48,6 +48,10 @@ No license is given.
 
 A tab can also be closed by middle-clicking it. Closing the last tab quits.
 
+The Bookmarks, Preferences and About windows close with Ctrl+W or Escape, as
+well as with their close buttons. Closing the bookmarks editor keeps a change
+being typed, as leaving its field would, unless it isn't valid.
+
 Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`, with Servo's data, such as
 `cookie_jar.json`, beside them. Cookies are saved when the window is closed, so
 changes made since the last clean exit are lost in a crash.

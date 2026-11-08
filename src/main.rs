@@ -3,6 +3,7 @@
 mod bookmarks;
 mod bookmarks_editor;
 mod browser;
+mod closing;
 mod completion;
 mod fetch;
 mod filter;
