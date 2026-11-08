@@ -12,6 +12,8 @@ No license is given.
 ## Features
 
 - A browser window with a location field, and back, forward and reload.
+- Tabs, which can be reordered by dragging. A link or script that would open a
+  new window opens a new tab instead.
 - HTTP and HTTPS. TLS is done by Servo, with `rustls`, and certificates are
   checked with the system's trusted roots.
 - Simple bookmarks: the star button adds or removes the current page, and the
@@ -19,13 +21,19 @@ No license is given.
 - Cookies that persist between runs, in Servo's own cookie store.
 - The User-Agent is `BrowseGoo/` followed by the version.
 
-| Shortcut               | Action                |
-|------------------------|-----------------------|
-| Ctrl+L                 | Go to location field  |
-| Ctrl+D                 | Toggle bookmark       |
-| Ctrl+R, F5             | Reload                |
-| Alt+Left, Alt+Right    | Back, forward         |
-| Ctrl+Q                 | Quit                  |
+| Shortcut                    | Action               |
+|-----------------------------|----------------------|
+| Ctrl+L                      | Go to location field |
+| Ctrl+T                      | New tab              |
+| Ctrl+W                      | Close tab            |
+| Ctrl+Tab, Ctrl+PageDown     | Next tab             |
+| Ctrl+Shift+Tab, Ctrl+PageUp | Previous tab         |
+| Ctrl+D                      | Toggle bookmark      |
+| Ctrl+R, F5                  | Reload               |
+| Alt+Left, Alt+Right         | Back, forward        |
+| Ctrl+Q                      | Quit                 |
+
+A tab can also be closed by middle-clicking it. Closing the last tab quits.
 
 Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`, with Servo's data, such as
 `cookie_jar.json`, beside them. Cookies are saved when the window is closed, so
@@ -63,8 +71,7 @@ This is a starting point, and these are not done yet:
   it's slower than a GPU-accelerated browser.
 - Servo's features for WebGL, WebGPU, media playback and developer tools aren't
   compiled in.
-- There's one page per window, and only one window. A link that would open a new
-  window opens in the current one, replacing its back and forward history.
+- There's only one window.
 - There's no interface yet for `<select>` drop-downs, file pickers, color pickers,
   context menus, HTTP authentication, or the `alert()`, `confirm()` and `prompt()`
   dialogs.
