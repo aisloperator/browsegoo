@@ -118,9 +118,12 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
     };
     let preferences = Preferences {
         user_agent: format!("BrowseGoo/{VERSION}"),
-        // Servo has this but disables it by default, and sites that use it to reveal
-        // their content as it scrolls into view would otherwise stay partly blank.
+        // Servo has these, but disables them by default. Sites that use
+        // IntersectionObserver to reveal content as it scrolls into view would
+        // otherwise stay partly blank, and ad loaders that expect `visualViewport`
+        // give up without showing any ads.
         dom_intersection_observer_enabled: true,
+        dom_visual_viewport_enabled: true,
         ..Default::default()
     };
     let servo = ServoBuilder::default()
