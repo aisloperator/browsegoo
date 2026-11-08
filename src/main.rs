@@ -67,6 +67,15 @@ fn main() -> ExitCode {
         }
     };
 
+    // Icons in it are found by name, as the application adds its icons
+    // directory, under the resource path its ID implies, to the icon theme.
+    let resources = gio::Resource::from_data(&glib::Bytes::from_static(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/resources.gresource"
+    ))))
+    .expect("the compiled resources should be valid");
+    gio::resources_register(&resources);
+
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)

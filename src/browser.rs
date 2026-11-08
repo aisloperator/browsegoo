@@ -311,7 +311,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .build();
 
     let bookmark = gtk::ToggleButton::builder()
-        .icon_name("non-starred-symbolic")
+        .icon_name("browsegoo-star-outline-symbolic")
         .tooltip_text("Bookmark this page (Ctrl+D)")
         .build();
 
@@ -1278,10 +1278,12 @@ impl Browser {
             .is_some_and(|url| self.bookmarks.borrow().contains(url.as_str()));
         let button = &self.widgets.bookmark;
         button.set_active(is_bookmarked);
+        // BrowseGoo's own stars, as the theme's empty one is faded, like a
+        // disabled button's.
         button.set_icon_name(if is_bookmarked {
-            "starred-symbolic"
+            "browsegoo-star-filled-symbolic"
         } else {
-            "non-starred-symbolic"
+            "browsegoo-star-outline-symbolic"
         });
     }
 

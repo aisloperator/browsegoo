@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Compiled into the program by build.rs. -->
+<gresources>
+  <gresource prefix="/com/aisloperator/BrowseGoo">
+    <file preprocess="xml-stripblanks">icons/scalable/actions/browsegoo-star-filled-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/browsegoo-star-outline-symbolic.svg</file>
+  </gresource>
+</gresources>

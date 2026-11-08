@@ -67,6 +67,9 @@ the development files for GTK4. On Debian or Ubuntu, that is:
 
     sudo apt install build-essential pkg-config libgtk-4-dev
 
+The build also uses GLib's `glib-compile-resources`, which comes with those, to
+build BrowseGoo's icons in `resources` into the program.
+
 Then:
 
     cargo build --release
