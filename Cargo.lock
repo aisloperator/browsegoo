@@ -488,10 +488,12 @@ dependencies = [
 name = "browsegoo"
 version = "0.1.0"
 dependencies = [
+ "content-security-policy",
  "dpi",
  "euclid",
  "gtk4",
  "rustls",
+ "rustls-platform-verifier",
  "servo",
  "url",
 ]

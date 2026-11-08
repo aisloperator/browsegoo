@@ -2,8 +2,12 @@
 
 mod bookmarks;
 mod browser;
+mod fetch;
+mod filter;
+mod filter_lists;
 mod input;
 mod location;
+mod preferences;
 mod web_area;
 
 use std::path::PathBuf;

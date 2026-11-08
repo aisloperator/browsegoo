@@ -18,6 +18,10 @@ No license is given.
   checked with the system's trusted roots.
 - Simple bookmarks: the star button adds or removes the current page, and the
   button next to it lists them.
+- Filtering of ad and tracking requests, with lists like EasyList. The shield
+  button's tooltip says how many requests were blocked on the current page, and
+  its menu turns filtering off or on for the current tab, and opens the
+  preferences, where lists are enabled and downloaded.
 - Cookies that persist between runs, in Servo's own cookie store.
 - The User-Agent is `BrowseGoo/` followed by the version.
 
@@ -38,6 +42,10 @@ A tab can also be closed by middle-clicking it. Closing the last tab quits.
 Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`, with Servo's data, such as
 `cookie_jar.json`, beside them. Cookies are saved when the window is closed, so
 changes made since the last clean exit are lost in a crash.
+
+Which filter lists are enabled is in `~/.config/browsegoo/filter_lists.tsv`, and
+the downloaded lists are in `~/.cache/browsegoo/`. Lists are only downloaded with
+the Update Lists button in the preferences, so filtering does nothing until then.
 
 ## Building
 
@@ -76,3 +84,6 @@ This is a starting point, and these are not done yet:
   context menus, HTTP authentication, or the `alert()`, `confirm()` and `prompt()`
   dialogs.
 - Keyboard input doesn't go through an input method, so composed text doesn't work.
+- Filtering only blocks requests by URL. It doesn't hide page elements, so blocked
+  ads can leave empty space. Rules it can't apply correctly are skipped, such as
+  regular expressions, redirects and scriptlets, and the preferences say how many.

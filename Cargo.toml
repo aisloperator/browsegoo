@@ -13,9 +13,14 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] 
 servo = { version = "0.8.0", default-features = false, features = ["bundled", "js_jit"] }
 
 # These appear in Servo's public API, and are already dependencies of Servo.
+content-security-policy = "0.9"
 dpi = "0.1"
 euclid = "0.22"
 url = "2"
+
+# Already a dependency of Servo, for checking certificates when downloading
+# filter lists.
+rustls-platform-verifier = "0.7"
 
 # Keep memory use practical when compiling Servo's enormous crates.
 [profile.dev]

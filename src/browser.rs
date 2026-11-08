@@ -14,10 +14,12 @@
 //! page, and the pages themselves are in a `gtk::Stack` below the toolbar.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use content_security_policy::Destination;
 use dpi::PhysicalSize;
 use euclid::Scale;
 use gtk::prelude::*;
@@ -26,13 +28,16 @@ use servo::{
     ClipboardDelegate, CreateNewWebViewRequest, Cursor, DeviceIntRect, DevicePoint, EventLoopWaker,
     InputEvent, KeyState, LoadStatus, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
     MouseMoveEvent, Opts, Preferences, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, StringRequest, WebView, WebViewBuilder, WebViewDelegate, WebViewId,
-    WheelDelta, WheelEvent, WheelMode,
+    SoftwareRenderingContext, StringRequest, WebResourceLoad, WebResourceResponse, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
 
 use crate::bookmarks::Bookmarks;
+use crate::filter::{self, Engine, ResourceType};
+use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
+use crate::preferences::PreferencesWindow;
 use crate::web_area::WebArea;
 use crate::{VERSION, input};
 
@@ -86,6 +91,7 @@ struct Widgets {
     tabs: gtk::Notebook,
     pages: gtk::Stack,
     location: gtk::Entry,
+    filter_button: gtk::MenuButton,
     bookmark: gtk::ToggleButton,
     bookmark_list: gtk::ListBox,
     bookmarks_popover: gtk::Popover,
@@ -105,6 +111,9 @@ struct Tab {
     progress: Cell<f64>,
     /// Whether this was opened as a blank tab, for typing a location into.
     opened_blank: bool,
+    filtering: Cell<bool>,
+    /// Requests blocked since the current page started loading.
+    blocked: Cell<u32>,
 }
 
 impl Tab {
@@ -149,6 +158,15 @@ struct Browser {
     pointer: Cell<DevicePoint>,
     /// Servo's event loop must not be spun again from inside itself.
     spinning: Cell<bool>,
+    filter: RefCell<Rc<Engine>>,
+    filter_settings: RefCell<filter_lists::Settings>,
+    list_statuses: RefCell<BTreeMap<&'static str, ListStatus>>,
+    /// Where filter lists are cached.
+    cache_dir: PathBuf,
+    /// Counts filter rebuilds, so that only the newest one is used.
+    filter_generation: Cell<u64>,
+    updating_lists: Cell<bool>,
+    preferences: RefCell<Option<PreferencesWindow>>,
 }
 
 /// Opens the browser window at `start_url`.
@@ -195,6 +213,12 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
         eprintln!("Could not read bookmarks: {error}");
         std::process::exit(1);
     });
+    let filter_settings = filter_lists::Settings::load(config_dir.join("filter_lists.tsv"))
+        .unwrap_or_else(|error| {
+            // Carrying on would overwrite the settings that we couldn't read.
+            eprintln!("Could not read filter list settings: {error}");
+            std::process::exit(1);
+        });
 
     let browser = Rc::new(Browser {
         servo: RefCell::new(Some(servo)),
@@ -206,12 +230,20 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
         pending_size: Cell::new(None),
         pointer: Cell::new(DevicePoint::zero()),
         spinning: Cell::new(false),
+        filter: RefCell::new(Rc::new(Engine::default())),
+        filter_settings: RefCell::new(filter_settings),
+        list_statuses: RefCell::new(BTreeMap::new()),
+        cache_dir: glib::user_cache_dir().join("browsegoo"),
+        filter_generation: Cell::new(0),
+        updating_lists: Cell::new(false),
+        preferences: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
 
     browser.connect_widgets();
     browser.connect_actions(app);
     browser.rebuild_bookmark_list();
+    browser.reload_filters();
     browser.open_tab(start_url);
 
     gdk::GLContext::clear_current();
@@ -233,6 +265,14 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let forward = icon_button("go-next-symbolic", "Forward (Alt+Right)", "win.forward");
     let reload = icon_button("view-refresh-symbolic", "Reload (Ctrl+R)", "win.reload");
     let about = icon_button("help-about-symbolic", "About BrowseGoo", "win.about");
+
+    let filter_menu = gio::Menu::new();
+    filter_menu.append(Some("Filter This Tab"), Some("win.filter-tab"));
+    filter_menu.append(Some("Preferences"), Some("win.preferences"));
+    let filter_button = gtk::MenuButton::builder()
+        .icon_name("security-high-symbolic")
+        .menu_model(&filter_menu)
+        .build();
 
     let location = gtk::Entry::builder()
         .hexpand(true)
@@ -273,6 +313,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         forward.upcast_ref(),
         reload.upcast_ref(),
         location.upcast_ref(),
+        filter_button.upcast_ref(),
         bookmark.upcast_ref(),
         bookmarks_button.upcast_ref(),
         about.upcast_ref(),
@@ -322,6 +363,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         bookmark,
         bookmark_list,
         bookmarks_popover,
+        filter_button,
     }
 }
 
@@ -414,6 +456,8 @@ impl Browser {
             can_go_forward: Cell::new(false),
             progress: Cell::new(0.0),
             opened_blank,
+            filtering: Cell::new(true),
+            blocked: Cell::new(0),
         });
         tab.update_label();
 
@@ -464,6 +508,7 @@ impl Browser {
             .set_progress_fraction(active.progress.get());
         self.set_history_available(active.can_go_back.get(), active.can_go_forward.get());
         self.update_bookmark_button();
+        self.update_filter_button();
         self.focus_page_or_location();
         self.queue_resize();
         // Servo paints the newly shown page when it has a frame for it.
@@ -725,6 +770,23 @@ impl Browser {
         add_action("previous-tab", |browser| browser.select_tab_by_offset(-1));
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
+        add_action("preferences", |_| {
+            // The window needs the shared handle, rather than a borrowed one.
+            if let Some(browser) = current_browser() {
+                browser.show_preferences();
+            }
+        });
+
+        let filter_tab = gio::SimpleAction::new_stateful("filter-tab", None, &true.to_variant());
+        filter_tab.connect_activate(|_, _| {
+            if let Some(browser) = current_browser() {
+                if let Some(tab) = browser.active_tab() {
+                    tab.filtering.set(!tab.filtering.get());
+                }
+                browser.update_filter_button();
+            }
+        });
+        window.add_action(&filter_tab);
         add_action("quit", |browser| browser.widgets.window.close());
 
         app.set_accels_for_action("win.back", &["<Alt>Left"]);
@@ -879,6 +941,169 @@ impl Browser {
         self.update_bookmark_button();
     }
 
+    /// Shows whether the active tab is filtered, and how much it blocked.
+    fn update_filter_button(&self) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let filtering = tab.filtering.get();
+        if let Some(action) = self
+            .widgets
+            .window
+            .lookup_action("filter-tab")
+            .and_downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&filtering.to_variant());
+        }
+
+        let button = &self.widgets.filter_button;
+        button.set_icon_name(if filtering {
+            "security-high-symbolic"
+        } else {
+            "security-low-symbolic"
+        });
+        let tooltip = if !filtering {
+            "Filtering is off for this tab".to_owned()
+        } else {
+            let blocked = match tab.blocked.get() {
+                1 => "1 request blocked".to_owned(),
+                count => format!("{count} requests blocked"),
+            };
+            if self.filter.borrow().rule_count() == 0 {
+                format!("{blocked}\nNo filter lists are in use yet")
+            } else {
+                blocked
+            }
+        };
+        button.set_tooltip_text(Some(&tooltip));
+    }
+
+    /// Rebuilds the filter from the cached lists, in the background.
+    fn reload_filters(&self) {
+        let generation = self.filter_generation.get() + 1;
+        self.filter_generation.set(generation);
+        let enabled = self.filter_settings.borrow().enabled_lists();
+        let cache_dir = self.cache_dir.clone();
+        glib::spawn_future_local(async move {
+            let built =
+                gio::spawn_blocking(move || filter_lists::build_engine(&cache_dir, &enabled)).await;
+            let (Some(browser), Ok((engine, statuses))) = (current_browser(), built) else {
+                return;
+            };
+            if browser.filter_generation.get() != generation {
+                // A newer rebuild has started.
+                return;
+            }
+            browser.filter.replace(Rc::new(engine));
+            browser.list_statuses.replace(statuses);
+            if let Some(preferences) = browser.preferences.borrow().as_ref() {
+                preferences.show_statuses(&browser.list_statuses.borrow());
+            }
+            browser.update_filter_button();
+        });
+    }
+
+    fn show_preferences(self: &Rc<Self>) {
+        if self.preferences.borrow().is_none() {
+            let preferences =
+                PreferencesWindow::new(&self.widgets.window, &self.filter_settings.borrow());
+            for row in &preferences.rows {
+                let id = row.id;
+                row.check.connect_toggled(move |check| {
+                    let Some(browser) = current_browser() else {
+                        return;
+                    };
+                    let Some(list) = LISTS.iter().find(|list| list.id == id) else {
+                        return;
+                    };
+                    let result = browser
+                        .filter_settings
+                        .borrow_mut()
+                        .set_enabled(list, check.is_active());
+                    if let Err(error) = result {
+                        eprintln!("Could not save filter list settings: {error}");
+                    }
+                    browser.reload_filters();
+                });
+            }
+            preferences.update.connect_clicked(|_| {
+                if let Some(browser) = current_browser() {
+                    browser.update_lists();
+                }
+            });
+            preferences.show_statuses(&self.list_statuses.borrow());
+            self.preferences.replace(Some(preferences));
+        }
+        if let Some(preferences) = self.preferences.borrow().as_ref() {
+            preferences.window.present();
+        }
+    }
+
+    /// Downloads the enabled lists, in the background.
+    fn update_lists(&self) {
+        let lists = self.filter_settings.borrow().enabled_lists();
+        let show = |updating, message: &str| {
+            if let Some(preferences) = self.preferences.borrow().as_ref() {
+                preferences.show_update_state(updating, message);
+            }
+        };
+        if lists.is_empty() {
+            show(false, "No lists are enabled.");
+            return;
+        }
+        if self.updating_lists.replace(true) {
+            return;
+        }
+        show(true, "Updating\u{2026}");
+
+        let cache_dir = self.cache_dir.clone();
+        let user_agent = format!("BrowseGoo/{VERSION}");
+        glib::spawn_future_local(async move {
+            let results = gio::spawn_blocking(move || {
+                lists
+                    .iter()
+                    .map(|list| {
+                        (
+                            list.name,
+                            filter_lists::update(&cache_dir, list, &user_agent),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+            let Some(browser) = current_browser() else {
+                return;
+            };
+            browser.updating_lists.set(false);
+            let message = match results {
+                Err(_) => "Updating failed.".to_owned(),
+                Ok(results) => {
+                    let failures: Vec<String> = results
+                        .iter()
+                        .filter_map(|(name, result)| {
+                            result
+                                .as_ref()
+                                .err()
+                                .map(|error| format!("Could not update {name}: {error}."))
+                        })
+                        .collect();
+                    if failures.is_empty() {
+                        match results.len() {
+                            1 => "Updated 1 list.".to_owned(),
+                            count => format!("Updated {count} lists."),
+                        }
+                    } else {
+                        failures.join("\n")
+                    }
+                }
+            };
+            if let Some(preferences) = browser.preferences.borrow().as_ref() {
+                preferences.show_update_state(false, &message);
+            }
+            browser.reload_filters();
+        });
+    }
+
     fn update_bookmark_button(&self) {
         let is_bookmarked = self
             .webview()
@@ -967,8 +1192,12 @@ impl WebViewDelegate for Browser {
             LoadStatus::Complete | LoadStatus::Stopped => 0.0,
         };
         tab.progress.set(progress);
+        if status == LoadStatus::Started {
+            tab.blocked.set(0);
+        }
         if self.is_active(tab.id()) {
             self.widgets.location.set_progress_fraction(progress);
+            self.update_filter_button();
         }
     }
 
@@ -1002,11 +1231,67 @@ impl WebViewDelegate for Browser {
         browser.add_tab(webview, false);
     }
 
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
+        let Some(tab) = self.tab(webview.id()) else {
+            return;
+        };
+        if !tab.filtering.get() || load.request.is_for_main_frame {
+            return;
+        }
+        let url = load.request.url.as_url();
+        let (Some(host), "http" | "https") = (url.host_str(), url.scheme()) else {
+            return;
+        };
+        let page_url = tab.webview.url();
+        let page_host = page_url.as_ref().and_then(Url::host_str);
+        let site = |host| filter::registrable_domain(host, servo::is_reg_domain);
+        let request = filter::Request {
+            url: url.as_str(),
+            page_host,
+            page_url: page_url.as_ref().map(Url::as_str),
+            third_party: page_host.is_some_and(|page_host| site(page_host) != site(host)),
+            resource_type: resource_type(load.request.destination),
+        };
+        if !self.filter.borrow().should_block(&request) {
+            return;
+        }
+
+        tab.blocked.set(tab.blocked.get() + 1);
+        if self.is_active(tab.id()) {
+            self.update_filter_button();
+        }
+        // Cancelling makes the request fail before it's sent.
+        let response = WebResourceResponse::new(url.clone());
+        load.intercept(response).cancel();
+    }
+
     /// A page closed itself, such as with `window.close()`.
     fn notify_closed(&self, webview: WebView) {
         let id = webview.id();
         // This arrives while Servo is busy, and closing a tab needs Servo.
         glib::idle_add_local_once(move || close_tab_by_id(id));
+    }
+}
+
+fn resource_type(destination: Destination) -> ResourceType {
+    match destination {
+        Destination::Document => ResourceType::Document,
+        Destination::Frame | Destination::IFrame => ResourceType::Subdocument,
+        Destination::Script
+        | Destination::Worker
+        | Destination::SharedWorker
+        | Destination::ServiceWorker
+        | Destination::AudioWorklet
+        | Destination::PaintWorklet => ResourceType::Script,
+        Destination::Style | Destination::Xslt => ResourceType::Stylesheet,
+        Destination::Image => ResourceType::Image,
+        Destination::Font => ResourceType::Font,
+        Destination::Audio | Destination::Video | Destination::Track => ResourceType::Media,
+        Destination::Embed | Destination::Object => ResourceType::Object,
+        // Requests from `fetch()` and `XMLHttpRequest` have no destination.
+        Destination::None | Destination::Json => ResourceType::XmlHttpRequest,
+        Destination::Report => ResourceType::Ping,
+        Destination::Manifest | Destination::Text | Destination::WebIdentity => ResourceType::Other,
     }
 }
 
