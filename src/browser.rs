@@ -7,6 +7,11 @@
 //! Every tab has its own Servo `WebView`, but they all share that one surface.
 //! Only the active tab's `WebView` is shown there, and each tab has its own
 //! widget that keeps the last frame painted for it.
+//!
+//! The tabs are in the title bar, above the toolbar. A `gtk::Notebook` puts
+//! each page right under the tabs, with no room for a shared toolbar, so the
+//! notebook only provides the tabs, with an empty placeholder as each one's
+//! page, and the pages themselves are in a `gtk::Stack` below the toolbar.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -79,6 +84,7 @@ impl EventLoopWaker for Waker {
 struct Widgets {
     window: gtk::ApplicationWindow,
     tabs: gtk::Notebook,
+    pages: gtk::Stack,
     location: gtk::Entry,
     bookmark: gtk::ToggleButton,
     bookmark_list: gtk::ListBox,
@@ -90,6 +96,8 @@ struct Widgets {
 struct Tab {
     webview: WebView,
     area: WebArea,
+    /// This tab's page in the tab strip, which only stands in for `area`.
+    placeholder: gtk::Box,
     label: gtk::Label,
     title: RefCell<Option<String>>,
     can_go_back: Cell<bool>,
@@ -255,20 +263,28 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .popover(&bookmarks_popover)
         .build();
 
-    let header = gtk::HeaderBar::new();
-    header.pack_start(&back);
-    header.pack_start(&forward);
-    header.pack_start(&reload);
-    header.set_title_widget(Some(&location));
-    header.pack_end(&about);
-    header.pack_end(&bookmarks_button);
-    header.pack_end(&bookmark);
+    let toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .css_classes(["toolbar"])
+        .build();
+    for widget in [
+        back.upcast_ref::<gtk::Widget>(),
+        forward.upcast_ref(),
+        reload.upcast_ref(),
+        location.upcast_ref(),
+        bookmark.upcast_ref(),
+        bookmarks_button.upcast_ref(),
+        about.upcast_ref(),
+    ] {
+        toolbar.append(widget);
+    }
 
     let tabs = gtk::Notebook::builder()
         .scrollable(true)
         .show_border(false)
         .hexpand(true)
-        .vexpand(true)
+        .valign(gtk::Align::End)
         .build();
     let new_tab = gtk::Button::builder()
         .icon_name("tab-new-symbolic")
@@ -278,18 +294,30 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .build();
     tabs.set_action_widget(&new_tab, gtk::PackType::End);
 
+    // The empty parts of the title bar still move the window, as usual.
+    let title_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    title_bar.append(&tabs);
+    title_bar.append(&gtk::WindowControls::new(gtk::PackType::End));
+    let title_bar = gtk::WindowHandle::builder().child(&title_bar).build();
+
+    let pages = gtk::Stack::builder().hexpand(true).vexpand(true).build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&toolbar);
+    content.append(&pages);
+
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("BrowseGoo")
         .default_width(INITIAL_WIDTH)
         .default_height(INITIAL_HEIGHT)
-        .titlebar(&header)
-        .child(&tabs)
+        .titlebar(&title_bar)
+        .child(&content)
         .build();
 
     Widgets {
         window,
         tabs,
+        pages,
         location,
         bookmark,
         bookmark_list,
@@ -308,7 +336,7 @@ impl Browser {
         self.tabs
             .borrow()
             .iter()
-            .find(|tab| tab.area.upcast_ref::<gtk::Widget>() == &page)
+            .find(|tab| tab.placeholder.upcast_ref::<gtk::Widget>() == &page)
             .cloned()
     }
 
@@ -379,6 +407,7 @@ impl Browser {
         let tab = Rc::new(Tab {
             webview,
             area,
+            placeholder: gtk::Box::new(gtk::Orientation::Vertical, 0),
             label,
             title: RefCell::new(None),
             can_go_back: Cell::new(false),
@@ -390,9 +419,10 @@ impl Browser {
 
         // The tab must be known before the tab strip announces it as active.
         self.tabs.borrow_mut().push(tab.clone());
+        self.widgets.pages.add_child(&tab.area);
         let notebook = &self.widgets.tabs;
-        let index = notebook.append_page(&tab.area, Some(&tab_label));
-        notebook.set_tab_reorderable(&tab.area, true);
+        let index = notebook.append_page(&tab.placeholder, Some(&tab_label));
+        notebook.set_tab_reorderable(&tab.placeholder, true);
         notebook.set_current_page(Some(index));
     }
 
@@ -406,7 +436,8 @@ impl Browser {
         }
         self.tabs.borrow_mut().retain(|other| other.id() != id);
         // This makes another tab active, if this one was.
-        self.widgets.tabs.detach_tab(&tab.area);
+        self.widgets.tabs.detach_tab(&tab.placeholder);
+        self.widgets.pages.remove(&tab.area);
         // Dropping the last handle to the `WebView` closes it in Servo.
         drop(tab);
         Waker.wake();
@@ -423,6 +454,7 @@ impl Browser {
             }
         }
         active.webview.show();
+        self.widgets.pages.set_visible_child(&active.area);
 
         let title = active.title.borrow().clone();
         self.set_window_title(title.as_deref());
