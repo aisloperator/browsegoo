@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use content_security_policy::Destination;
 use dpi::PhysicalSize;
@@ -48,6 +49,9 @@ const INITIAL_HEIGHT: i32 = 768;
 const WHEEL_NOTCH_PIXELS: f64 = 76.0;
 
 const NEW_TAB_TITLE: &str = "New Tab";
+
+/// How soon after a middle-click a request for a new tab is taken to be from it.
+const MIDDLE_CLICK_WINDOW: Duration = Duration::from_secs(2);
 
 const CREDIT: &str = "Created by AI Sloperator with Claude Code";
 const WEBSITE: &str = "https://www.aisloperator.com/";
@@ -112,6 +116,8 @@ struct Tab {
     /// Whether this was opened as a blank tab, for typing a location into.
     opened_blank: bool,
     filtering: Cell<bool>,
+    /// The tab whose page opened this one, if any.
+    opener: Option<WebViewId>,
     /// Requests blocked since the current page started loading.
     blocked: Cell<u32>,
 }
@@ -167,6 +173,15 @@ struct Browser {
     filter_generation: Cell<u64>,
     updating_lists: Cell<bool>,
     preferences: RefCell<Option<PreferencesWindow>>,
+    /// The last middle-click on a page, if it might still open a tab.
+    middle_click: Cell<Option<MiddleClick>>,
+}
+
+#[derive(Clone, Copy)]
+struct MiddleClick {
+    tab: WebViewId,
+    at: Instant,
+    shift: bool,
 }
 
 /// Opens the browser window at `start_url`.
@@ -237,6 +252,7 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
         filter_generation: Cell::new(0),
         updating_lists: Cell::new(false),
         preferences: RefCell::new(None),
+        middle_click: Cell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
 
@@ -413,11 +429,23 @@ impl Browser {
         };
         let builder = WebViewBuilder::new(&servo, self.rendering_context.clone());
         let opened_blank = url.as_str() == "about:blank";
-        self.add_tab(self.webview_builder(builder.url(url)).build(), opened_blank);
+        self.add_tab(
+            self.webview_builder(builder.url(url)).build(),
+            opened_blank,
+            None,
+            true,
+        );
     }
 
-    /// Adds a tab for `webview`, and makes it the active tab.
-    fn add_tab(self: &Rc<Self>, webview: WebView, opened_blank: bool) {
+    /// Adds a tab for `webview`, which a page in the `opener` tab may have
+    /// opened, and makes it the active tab if `activate`.
+    fn add_tab(
+        self: &Rc<Self>,
+        webview: WebView,
+        opened_blank: bool,
+        opener: Option<WebViewId>,
+        activate: bool,
+    ) {
         let id = webview.id();
         let area = WebArea::new();
         self.connect_input(&area, id);
@@ -457,17 +485,43 @@ impl Browser {
             progress: Cell::new(0.0),
             opened_blank,
             filtering: Cell::new(true),
+            opener,
             blocked: Cell::new(0),
         });
         tab.update_label();
 
+        if !activate {
+            // Otherwise it would be painted over the active tab's page.
+            tab.webview.hide();
+        }
+
         // The tab must be known before the tab strip announces it as active.
         self.tabs.borrow_mut().push(tab.clone());
         self.widgets.pages.add_child(&tab.area);
+        let position = opener.and_then(|opener| self.position_for_tab_from(opener));
         let notebook = &self.widgets.tabs;
-        let index = notebook.append_page(&tab.placeholder, Some(&tab_label));
+        let index = notebook.insert_page(&tab.placeholder, Some(&tab_label), position);
         notebook.set_tab_reorderable(&tab.placeholder, true);
-        notebook.set_current_page(Some(index));
+        if activate {
+            notebook.set_current_page(Some(index));
+        }
+    }
+
+    /// Where a tab opened from the `opener` tab goes: after it, and after the
+    /// tabs it already opened, so that they stay in the order they were opened.
+    fn position_for_tab_from(&self, opener: WebViewId) -> Option<u32> {
+        let notebook = &self.widgets.tabs;
+        let mut position = notebook.page_num(&self.tab(opener)?.placeholder)? + 1;
+        while let Some(page) = notebook.nth_page(Some(position)) {
+            let opened_by_same_tab = self.tabs.borrow().iter().any(|tab| {
+                tab.placeholder.upcast_ref::<gtk::Widget>() == &page && tab.opener == Some(opener)
+            });
+            if !opened_by_same_tab {
+                break;
+            }
+            position += 1;
+        }
+        Some(position)
     }
 
     fn close_tab(&self, id: WebViewId) {
@@ -859,6 +913,16 @@ impl Browser {
             send_click(gesture, MouseButtonAction::Down, x, y);
         });
         clicks.connect_released(move |gesture, _, x, y| {
+            if gesture.current_button() == gdk::BUTTON_MIDDLE {
+                if let Some(browser) = current_browser() {
+                    let state = gesture.current_event_state();
+                    browser.middle_click.set(Some(MiddleClick {
+                        tab: id,
+                        at: Instant::now(),
+                        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+                    }));
+                }
+            }
             send_click(gesture, MouseButtonAction::Up, x, y);
         });
         area.add_controller(clicks);
@@ -1219,16 +1283,25 @@ impl WebViewDelegate for Browser {
         }
     }
 
-    /// A page that opens a new window, such as with a `target="_blank"` link,
-    /// gets a new tab instead.
-    fn request_create_new(&self, _parent: WebView, request: CreateNewWebViewRequest) {
+    /// A page that opens a new window, such as with a `target="_blank"` link or
+    /// a middle-click on a link, gets a new tab instead. A middle-click opens it
+    /// in the background, unless Shift is held.
+    fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
         let Some(browser) = current_browser() else {
             return;
         };
+        // Servo doesn't say what the request is for, so it's taken to be from a
+        // middle-click if there was one on the page just before.
+        let middle_click = self
+            .middle_click
+            .take()
+            .filter(|click| click.tab == parent.id() && click.at.elapsed() < MIDDLE_CLICK_WINDOW);
+        let activate = middle_click.is_none_or(|click| click.shift);
+
         let webview = browser
             .webview_builder(request.builder(self.rendering_context.clone()))
             .build();
-        browser.add_tab(webview, false);
+        browser.add_tab(webview, false, Some(parent.id()), activate);
     }
 
     fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {

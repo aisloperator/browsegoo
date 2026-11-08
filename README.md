@@ -13,7 +13,9 @@ No license is given.
 
 - A browser window with a location field, and back, forward and reload.
 - Tabs, which can be reordered by dragging. A link or script that would open a
-  new window opens a new tab instead.
+  new window opens a new tab instead. Middle-clicking a link opens it in a new
+  tab in the background, or with Shift held, switches to it. Tabs opened from a
+  page go after its tab, in the order they were opened.
 - HTTP and HTTPS. TLS is done by Servo, with `rustls`, and certificates are
   checked with the system's trusted roots.
 - Simple bookmarks: the star button adds or removes the current page, and the
