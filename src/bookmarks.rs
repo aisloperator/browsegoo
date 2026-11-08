@@ -52,6 +52,30 @@ impl Bookmarks {
         if index >= self.items.len() {
             return Err("That bookmark no longer exists.".to_owned());
         }
+        self.check_url(url, Some(index))?;
+        self.items[index] = Bookmark {
+            url: url.to_owned(),
+            title: single_line(title),
+        };
+        self.save_for_edit()
+    }
+
+    /// Adds a bookmark at `index`, or at the end if that's past it.
+    pub fn insert(&mut self, index: usize, url: &str, title: &str) -> Result<(), String> {
+        self.check_url(url, None)?;
+        let index = index.min(self.items.len());
+        self.items.insert(
+            index,
+            Bookmark {
+                url: url.to_owned(),
+                title: single_line(title),
+            },
+        );
+        self.save_for_edit()
+    }
+
+    /// Checks that `url` can be the bookmark at `index`, or a new one.
+    fn check_url(&self, url: &str, index: Option<usize>) -> Result<(), String> {
         if url.is_empty() || url.contains(char::is_whitespace) {
             return Err("That isn't a valid address.".to_owned());
         }
@@ -59,14 +83,14 @@ impl Bookmarks {
             .items
             .iter()
             .enumerate()
-            .any(|(other, item)| other != index && item.url == url);
+            .any(|(other, item)| Some(other) != index && item.url == url);
         if is_duplicate {
             return Err("That address is already bookmarked.".to_owned());
         }
-        self.items[index] = Bookmark {
-            url: url.to_owned(),
-            title: single_line(title),
-        };
+        Ok(())
+    }
+
+    fn save_for_edit(&self) -> Result<(), String> {
         self.save()
             .map_err(|error| format!("Could not save bookmarks: {error}"))
     }
@@ -206,6 +230,31 @@ mod tests {
             urls(&bookmarks),
             ["https://a.example/", "https://b.example/"]
         );
+    }
+
+    #[test]
+    fn inserting_checks_and_persists() {
+        let path = temporary_path("insert");
+        let mut bookmarks = Bookmarks::load(path.clone()).unwrap();
+        bookmarks.toggle("https://a.example/", "A").unwrap();
+        bookmarks.toggle("https://c.example/", "C").unwrap();
+
+        bookmarks.insert(1, "https://b.example/", "B\tee").unwrap();
+        bookmarks.insert(99, "https://d.example/", "D").unwrap();
+        assert!(bookmarks.insert(0, "https://a.example/", "A").is_err());
+        assert!(bookmarks.insert(0, "", "Nothing").is_err());
+
+        let reloaded = Bookmarks::load(path).unwrap();
+        assert_eq!(
+            urls(&reloaded),
+            [
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+                "https://d.example/"
+            ]
+        );
+        assert_eq!(reloaded.items()[1].title, "B ee");
     }
 
     #[test]

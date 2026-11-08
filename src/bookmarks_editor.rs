@@ -11,6 +11,11 @@ use crate::location::parse_location;
 
 /// A change to the bookmarks, which the browser makes and saves.
 pub enum Edit {
+    Add {
+        index: usize,
+        url: String,
+        title: String,
+    },
     Change {
         index: usize,
         url: String,
@@ -32,11 +37,15 @@ pub struct BookmarksEditor {
     move_up: gtk::Button,
     move_down: gtk::Button,
     delete: gtk::Button,
+    add: gtk::Button,
     apply: Box<dyn Fn(Edit) -> Result<(), String>>,
     open: Box<dyn Fn(&str)>,
+    current_page: Box<dyn Fn() -> Option<Bookmark>>,
     items: RefCell<Vec<Bookmark>>,
     /// The bookmark the fields are for.
     editing: Cell<Option<usize>>,
+    /// Where a new bookmark goes, while the fields are for one.
+    adding: Cell<Option<usize>>,
     /// Which bookmark to select when the list is next shown.
     select_next: Cell<Option<usize>>,
     /// Set while the fields are being filled in, rather than edited.
@@ -44,11 +53,13 @@ pub struct BookmarksEditor {
 }
 
 impl BookmarksEditor {
-    /// Makes the window. `apply` makes changes, and `open` opens a URL.
+    /// Makes the window. `apply` makes changes, `open` opens a URL, and
+    /// `current_page` is what a new bookmark starts as.
     pub fn new(
         parent: &gtk::ApplicationWindow,
         apply: impl Fn(Edit) -> Result<(), String> + 'static,
         open: impl Fn(&str) + 'static,
+        current_page: impl Fn() -> Option<Bookmark> + 'static,
     ) -> Rc<Self> {
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
@@ -56,7 +67,7 @@ impl BookmarksEditor {
             .build();
         list.set_placeholder(Some(
             &gtk::Label::builder()
-                .label("No bookmarks yet. The star button bookmarks the current page.")
+                .label("No bookmarks yet. Add one, or bookmark a page with the star button.")
                 .wrap(true)
                 .margin_top(24)
                 .margin_bottom(24)
@@ -98,6 +109,7 @@ impl BookmarksEditor {
             .visible(false)
             .build();
 
+        let add = gtk::Button::with_label("Add");
         let move_up = gtk::Button::with_label("Move Up");
         let move_down = gtk::Button::with_label("Move Down");
         let delete = gtk::Button::builder()
@@ -107,6 +119,7 @@ impl BookmarksEditor {
             .halign(gtk::Align::End)
             .build();
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        buttons.append(&add);
         buttons.append(&move_up);
         buttons.append(&move_down);
         buttons.append(&delete);
@@ -142,10 +155,13 @@ impl BookmarksEditor {
             move_up,
             move_down,
             delete,
+            add,
             apply: Box::new(apply),
             open: Box::new(open),
+            current_page: Box::new(current_page),
             items: RefCell::new(Vec::new()),
             editing: Cell::new(None),
+            adding: Cell::new(None),
             select_next: Cell::new(None),
             loading: Cell::new(false),
         });
@@ -194,6 +210,13 @@ impl BookmarksEditor {
             });
             entry.add_controller(focus);
         }
+
+        let editor = Rc::downgrade(self);
+        self.add.connect_clicked(move |_| {
+            if let Some(editor) = editor.upgrade() {
+                editor.start_adding();
+            }
+        });
 
         let buttons = [(&self.move_up, -1), (&self.move_down, 1), (&self.delete, 0)];
         for (button, offset) in buttons {
@@ -255,6 +278,10 @@ impl BookmarksEditor {
         }
         self.loading.set(false);
 
+        if self.adding.get().is_some() && selected.is_none() {
+            // Keep what's being typed for a new bookmark.
+            return;
+        }
         let row = selected.and_then(|index| self.list.row_at_index(index as i32));
         self.list.select_row(row.as_ref());
         self.load(row.map(|row| row.index() as usize));
@@ -268,6 +295,7 @@ impl BookmarksEditor {
         let item = index.and_then(|index| self.items.borrow().get(index).cloned());
         let index = item.as_ref().and(index);
         self.editing.set(index);
+        self.adding.set(None);
 
         self.loading.set(true);
         self.title
@@ -288,8 +316,45 @@ impl BookmarksEditor {
             .set_sensitive(index.is_some_and(|index| index + 1 < count));
     }
 
+    /// Empties the fields for a new bookmark, or fills them in with the current
+    /// page if it isn't bookmarked. It goes after the selected one, if any.
+    fn start_adding(&self) {
+        let index = self
+            .editing
+            .get()
+            .map_or(self.items.borrow().len(), |index| index + 1);
+        self.list.unselect_all();
+        self.editing.set(None);
+        self.adding.set(Some(index));
+
+        let page = (self.current_page)()
+            .filter(|page| !self.items.borrow().iter().any(|item| item.url == page.url));
+        self.loading.set(true);
+        self.title
+            .set_text(page.as_ref().map_or("", |page| page.title.as_str()));
+        self.address
+            .set_text(page.as_ref().map_or("", |page| page.url.as_str()));
+        self.loading.set(false);
+        self.show_error(None);
+
+        self.title.set_sensitive(true);
+        self.address.set_sensitive(true);
+        self.delete.set_sensitive(false);
+        self.move_up.set_sensitive(false);
+        self.move_down.set_sensitive(false);
+        if page.is_some() {
+            self.title.grab_focus();
+        } else {
+            self.address.grab_focus();
+        }
+    }
+
     fn save_fields(&self) {
         if self.loading.get() {
+            return;
+        }
+        if let Some(index) = self.adding.get() {
+            self.save_new(index);
             return;
         }
         let Some(index) = self.editing.get() else {
@@ -309,6 +374,31 @@ impl BookmarksEditor {
         };
         self.select_next.set(Some(index));
         self.make(Edit::Change {
+            index,
+            url: url.to_string(),
+            title,
+        });
+    }
+
+    /// Adds the new bookmark once it has an address. Until then, as when moving
+    /// from the title to the address, there's nothing to complain about.
+    fn save_new(&self, index: usize) {
+        let address = self.address.text().trim().to_owned();
+        if address.is_empty() {
+            return;
+        }
+        let Some(url) = parse_location(&address) else {
+            self.show_error(Some("That isn't a valid address."));
+            return;
+        };
+        let title = self.title.text().trim().to_owned();
+        let title = if title.is_empty() {
+            url.to_string()
+        } else {
+            title
+        };
+        self.select_next.set(Some(index));
+        self.make(Edit::Add {
             index,
             url: url.to_string(),
             title,

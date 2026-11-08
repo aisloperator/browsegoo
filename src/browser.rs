@@ -34,7 +34,7 @@ use servo::{
 };
 use url::Url;
 
-use crate::bookmarks::Bookmarks;
+use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::filter::{self, Engine, ResourceType};
 use crate::filter_lists::{self, LISTS, ListStatus};
@@ -1062,6 +1062,7 @@ impl Browser {
                         browser.navigate(url);
                     }
                 },
+                || current_browser().and_then(|browser| browser.current_page()),
             );
             editor.show_bookmarks(self.bookmarks.borrow().items());
             self.bookmarks_editor.replace(Some(editor));
@@ -1072,6 +1073,20 @@ impl Browser {
         }
     }
 
+    /// The active tab's page, as a bookmark of it would be.
+    fn current_page(&self) -> Option<Bookmark> {
+        let webview = self.webview()?;
+        let url = webview.url()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        let title = webview.page_title().unwrap_or_else(|| url.to_string());
+        Some(Bookmark {
+            url: url.to_string(),
+            title,
+        })
+    }
+
     fn edit_bookmarks(&self, edit: Edit) -> Result<(), String> {
         let result = {
             let mut bookmarks = self.bookmarks.borrow_mut();
@@ -1079,6 +1094,7 @@ impl Browser {
                 result.map_err(|error| format!("Could not save bookmarks: {error}"))
             };
             match edit {
+                Edit::Add { index, url, title } => bookmarks.insert(index, &url, &title),
                 Edit::Change { index, url, title } => bookmarks.edit(index, &url, &title),
                 Edit::Remove(index) => saved(bookmarks.remove(index)),
                 Edit::Move { from, to } => saved(bookmarks.move_item(from, to)),
