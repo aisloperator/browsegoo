@@ -12,6 +12,10 @@ No license is given.
 ## Features
 
 - A browser window with a location field, and back, forward and reload.
+- Completion in the location field from the bookmarks, like Firefox's. As an
+  address is typed, the rest of a bookmarked one is filled in, which Tab accepts,
+  and matching bookmarks are listed below the field, to choose with the arrow
+  keys and Enter, or a click.
 - Tabs, which can be reordered by dragging. A link or script that would open a
   new window opens a new tab instead. Middle-clicking a link opens it in a new
   tab in the background, or with Shift held, switches to it. Tabs opened from a

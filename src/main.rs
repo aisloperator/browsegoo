@@ -2,11 +2,13 @@
 
 mod bookmarks;
 mod browser;
+mod completion;
 mod fetch;
 mod filter;
 mod filter_lists;
 mod input;
 mod location;
+mod location_bar;
 mod preferences;
 mod web_area;
 

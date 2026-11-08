@@ -38,6 +38,7 @@ use crate::bookmarks::Bookmarks;
 use crate::filter::{self, Engine, ResourceType};
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
+use crate::location_bar::LocationBar;
 use crate::preferences::PreferencesWindow;
 use crate::web_area::WebArea;
 use crate::{VERSION, input};
@@ -95,6 +96,7 @@ struct Widgets {
     tabs: gtk::Notebook,
     pages: gtk::Stack,
     location: gtk::Entry,
+    location_bar: Rc<LocationBar>,
     filter_button: gtk::MenuButton,
     bookmark: gtk::ToggleButton,
     bookmark_list: gtk::ListBox,
@@ -375,6 +377,19 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         window,
         tabs,
         pages,
+        location_bar: LocationBar::new(
+            &location,
+            || {
+                current_browser()
+                    .map(|browser| browser.bookmarks.borrow().items().to_vec())
+                    .unwrap_or_default()
+            },
+            |url| {
+                if let (Some(browser), Some(url)) = (current_browser(), parse_location(url)) {
+                    browser.navigate(url);
+                }
+            },
+        ),
         location,
         bookmark,
         bookmark_list,
@@ -556,7 +571,7 @@ impl Browser {
 
         let title = active.title.borrow().clone();
         self.set_window_title(title.as_deref());
-        self.widgets.location.set_text(&active.location_text());
+        self.widgets.location_bar.set_text(&active.location_text());
         self.widgets
             .location
             .set_progress_fraction(active.progress.get());
@@ -737,7 +752,8 @@ impl Browser {
 
         widgets.location.connect_activate(|entry| {
             if let Some(browser) = current_browser() {
-                match parse_location(&entry.text()) {
+                let text = browser.widgets.location_bar.activation_text();
+                match parse_location(&text) {
                     Some(url) => browser.navigate(url),
                     None => entry.error_bell(),
                 }
@@ -1229,7 +1245,7 @@ impl WebViewDelegate for Browser {
         tab.update_label();
         if self.is_active(tab.id()) {
             if !self.is_editing_location() {
-                self.widgets.location.set_text(&tab.location_text());
+                self.widgets.location_bar.set_text(&tab.location_text());
             }
             self.update_bookmark_button();
         }
