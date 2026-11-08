@@ -23,7 +23,9 @@ No license is given.
 - HTTP and HTTPS. TLS is done by Servo, with `rustls`, and certificates are
   checked with the system's trusted roots.
 - Simple bookmarks: the star button adds or removes the current page, and the
-  button next to it lists them.
+  button next to it lists them. They can be renamed, changed, reordered and
+  deleted in the bookmarks editor, from the main menu (the button with three
+  lines), which also has the preferences and About.
 - Filtering of ad and tracking requests, with lists like EasyList. The shield
   button's tooltip says how many requests were blocked on the current page, and
   its menu turns filtering off or on for the current tab, and opens the
@@ -39,6 +41,7 @@ No license is given.
 | Ctrl+Tab, Ctrl+PageDown     | Next tab             |
 | Ctrl+Shift+Tab, Ctrl+PageUp | Previous tab         |
 | Ctrl+D                      | Toggle bookmark      |
+| Ctrl+Shift+O                | Edit bookmarks       |
 | Ctrl+R, F5                  | Reload               |
 | Alt+Left, Alt+Right         | Back, forward        |
 | Ctrl+Q                      | Quit                 |

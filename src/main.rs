@@ -1,6 +1,7 @@
 //! BrowseGoo: a barebones Web browser built around the Servo engine, using GTK4.
 
 mod bookmarks;
+mod bookmarks_editor;
 mod browser;
 mod completion;
 mod fetch;

@@ -35,6 +35,7 @@ use servo::{
 use url::Url;
 
 use crate::bookmarks::Bookmarks;
+use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::filter::{self, Engine, ResourceType};
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
@@ -177,6 +178,7 @@ struct Browser {
     preferences: RefCell<Option<PreferencesWindow>>,
     /// The last middle-click on a page, if it might still open a tab.
     middle_click: Cell<Option<MiddleClick>>,
+    bookmarks_editor: RefCell<Option<Rc<BookmarksEditor>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -255,6 +257,7 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
         updating_lists: Cell::new(false),
         preferences: RefCell::new(None),
         middle_click: Cell::new(None),
+        bookmarks_editor: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
 
@@ -282,7 +285,15 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let back = icon_button("go-previous-symbolic", "Back (Alt+Left)", "win.back");
     let forward = icon_button("go-next-symbolic", "Forward (Alt+Right)", "win.forward");
     let reload = icon_button("view-refresh-symbolic", "Reload (Ctrl+R)", "win.reload");
-    let about = icon_button("help-about-symbolic", "About BrowseGoo", "win.about");
+    let main_menu = gio::Menu::new();
+    main_menu.append(Some("Bookmarks"), Some("win.edit-bookmarks"));
+    main_menu.append(Some("Preferences"), Some("win.preferences"));
+    main_menu.append(Some("About BrowseGoo"), Some("win.about"));
+    let main_menu_button = gtk::MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Main menu")
+        .menu_model(&main_menu)
+        .build();
 
     let filter_menu = gio::Menu::new();
     filter_menu.append(Some("Filter This Tab"), Some("win.filter-tab"));
@@ -334,7 +345,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         filter_button.upcast_ref(),
         bookmark.upcast_ref(),
         bookmarks_button.upcast_ref(),
-        about.upcast_ref(),
+        main_menu_button.upcast_ref(),
     ] {
         toolbar.append(widget);
     }
@@ -840,6 +851,12 @@ impl Browser {
         add_action("previous-tab", |browser| browser.select_tab_by_offset(-1));
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
+        add_action("edit-bookmarks", |_| {
+            // The window needs the shared handle, rather than a borrowed one.
+            if let Some(browser) = current_browser() {
+                browser.show_bookmarks_editor();
+            }
+        });
         add_action("preferences", |_| {
             // The window needs the shared handle, rather than a borrowed one.
             if let Some(browser) = current_browser() {
@@ -865,6 +882,7 @@ impl Browser {
         app.set_accels_for_action("win.focus-location", &["<Control>l"]);
         app.set_accels_for_action("win.toggle-bookmark", &["<Control>d"]);
         app.set_accels_for_action("win.quit", &["<Control>q"]);
+        app.set_accels_for_action("win.edit-bookmarks", &["<Control><Shift>o"]);
         app.set_accels_for_action("win.new-tab", &["<Control>t"]);
         app.set_accels_for_action("win.close-tab", &["<Control>w"]);
         app.set_accels_for_action("win.next-tab", &["<Control>Tab", "<Control>Page_Down"]);
@@ -1015,10 +1033,62 @@ impl Browser {
                 if let Err(error) = result {
                     eprintln!("Could not save bookmarks: {error}");
                 }
-                self.rebuild_bookmark_list();
             }
         }
+        self.bookmarks_changed();
+    }
+
+    /// Updates everything that shows the bookmarks.
+    fn bookmarks_changed(&self) {
+        self.rebuild_bookmark_list();
         self.update_bookmark_button();
+        let editor = self.bookmarks_editor.borrow().clone();
+        if let Some(editor) = editor {
+            let items = self.bookmarks.borrow().items().to_vec();
+            editor.show_bookmarks(&items);
+        }
+    }
+
+    fn show_bookmarks_editor(self: &Rc<Self>) {
+        if self.bookmarks_editor.borrow().is_none() {
+            let editor = BookmarksEditor::new(
+                &self.widgets.window,
+                |edit| match current_browser() {
+                    Some(browser) => browser.edit_bookmarks(edit),
+                    None => Ok(()),
+                },
+                |url| {
+                    if let (Some(browser), Some(url)) = (current_browser(), parse_location(url)) {
+                        browser.navigate(url);
+                    }
+                },
+            );
+            editor.show_bookmarks(self.bookmarks.borrow().items());
+            self.bookmarks_editor.replace(Some(editor));
+        }
+        let editor = self.bookmarks_editor.borrow().clone();
+        if let Some(editor) = editor {
+            editor.present();
+        }
+    }
+
+    fn edit_bookmarks(&self, edit: Edit) -> Result<(), String> {
+        let result = {
+            let mut bookmarks = self.bookmarks.borrow_mut();
+            let saved = |result: std::io::Result<()>| {
+                result.map_err(|error| format!("Could not save bookmarks: {error}"))
+            };
+            match edit {
+                Edit::Change { index, url, title } => bookmarks.edit(index, &url, &title),
+                Edit::Remove(index) => saved(bookmarks.remove(index)),
+                Edit::Move { from, to } => saved(bookmarks.move_item(from, to)),
+            }
+        };
+        if result.is_ok() {
+            // Not otherwise, which would replace what was typed in the editor.
+            self.bookmarks_changed();
+        }
+        result
     }
 
     /// Shows whether the active tab is filtered, and how much it blocked.
