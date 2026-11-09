@@ -262,6 +262,9 @@ impl SiteDataWindow {
         let columns = gtk::ColumnView::builder()
             .show_column_separators(true)
             .build();
+        // GTK's compact rows for tables of data. Setting the classes instead
+        // would remove the ones GTK gives it.
+        columns.add_css_class("data-table");
         let sorted = gtk::SortListModel::new(Some(filtered), columns.sorter());
         let selection = gtk::MultiSelection::new(Some(sorted));
         columns.set_model(Some(&selection));
