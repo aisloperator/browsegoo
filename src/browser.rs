@@ -26,6 +26,7 @@ use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
 use crate::preferences::PreferencesWindow;
+use crate::site_data::SiteDataWindow;
 
 const INITIAL_WIDTH: i32 = 1024;
 const INITIAL_HEIGHT: i32 = 768;
@@ -182,6 +183,7 @@ struct Browser {
     start_page: RefCell<Option<(TabId, Url)>>,
     preferences: RefCell<Option<PreferencesWindow>>,
     bookmarks_editor: RefCell<Option<Rc<BookmarksEditor>>>,
+    site_data: RefCell<Option<Rc<SiteDataWindow>>>,
 }
 
 /// Opens the browser window at `start_url`.
@@ -234,6 +236,7 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
         start_page: RefCell::new(None),
         preferences: RefCell::new(None),
         bookmarks_editor: RefCell::new(None),
+        site_data: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
 
@@ -267,6 +270,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let reload = icon_button("view-refresh-symbolic", "Reload (Ctrl+R)", "win.reload");
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Bookmarks"), Some("win.edit-bookmarks"));
+    main_menu.append(Some("Cookies and Site Data"), Some("win.site-data"));
     main_menu.append(Some("Preferences"), Some("win.preferences"));
     main_menu.append(Some("About BrowseGoo"), Some("win.about"));
     let main_menu_button = gtk::MenuButton::builder()
@@ -820,6 +824,7 @@ impl Browser {
         add_action("previous-tab", |browser| browser.select_tab_by_offset(-1));
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
+        add_action("site-data", Browser::show_site_data);
         add_action("edit-bookmarks", |_| {
             // The window needs the shared handle, rather than a borrowed one.
             if let Some(browser) = current_browser() {
@@ -898,6 +903,23 @@ impl Browser {
         if let Some(editor) = editor {
             let items = self.bookmarks.borrow().items().to_vec();
             editor.show_bookmarks(&items);
+        }
+    }
+
+    fn show_site_data(&self) {
+        if self.site_data.borrow().is_none() {
+            let (Some(cookies), Some(data)) = (
+                self.network_session.cookie_manager(),
+                self.network_session.website_data_manager(),
+            ) else {
+                return;
+            };
+            let window = SiteDataWindow::new(&self.widgets.window, cookies, data);
+            self.site_data.replace(Some(window));
+        }
+        let window = self.site_data.borrow().clone();
+        if let Some(window) = window {
+            window.present();
         }
     }
 

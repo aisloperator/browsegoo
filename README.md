@@ -34,6 +34,15 @@ No license is given.
   downloaded.
 - Cookies, and what sites store, such as with `localStorage`, persist between
   runs.
+- A Cookies and Site Data window, from the main menu, which lists each cookie,
+  and each kind of other data that a site has stored, such as local storage or
+  IndexedDB. A field above the list filters it by site or name. Selecting one
+  item shows more about it below, such as a cookie's whole value and when it
+  expires, and the selected items can be deleted. Cookies are listed again as
+  they change, and other data whenever the window is switched to, or with its
+  Refresh button, as WebKit doesn't say when that changes. WebKit only deletes
+  a kind of data other than cookies for a whole site at once, such as all of a
+  site's local storage, so that's one item.
 - Page content runs in separate, sandboxed processes. See
   [Process isolation](#process-isolation).
 - The User-Agent is `BrowseGoo/` followed by the version.
@@ -71,7 +80,7 @@ changes. The compiled lists are large: about 90 MB for all four.
 ## Building
 
 You need stable Rust from [rustup](https://rustup.rs/), a C compiler, and the
-development files for GTK4 and WebKitGTK 6.0. On Debian 13 or Ubuntu 24.04 and
+development files for GTK4 and WebKitGTK 6.0, version 2.42 or later. On Debian 13 or Ubuntu 24.04 and
 later, that is:
 
     sudo apt install build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
