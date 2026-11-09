@@ -68,7 +68,8 @@ impl ResourceType {
 }
 
 const ALL_TYPES: u16 = (1 << 12) - 1;
-/// Rules with no type options apply to everything but whole pages.
+/// Rules with no type options apply to everything but whole pages, except for
+/// those that are just a host name, as in uBlock Origin's strict blocking.
 const DEFAULT_TYPES: u16 = ALL_TYPES & !(1 << ResourceType::Document as u16);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -227,8 +228,9 @@ fn url_triggers(rule: &Rule) -> Option<Vec<String>> {
         }
     }
 
-    // Documents loading in frames are a type of their own in these lists, but
-    // in WebKit they're documents loading in a child frame.
+    // Pages and documents loading in frames are types of their own in these
+    // lists, but in WebKit they're documents loading in the top frame or a
+    // child frame.
     let mut type_sets = Vec::new();
     let mut names: Vec<&str> = Vec::new();
     for kind in ResourceType::ALL {
@@ -242,10 +244,16 @@ fn url_triggers(rule: &Rule) -> Option<Vec<String>> {
         let names: Vec<String> = names.iter().map(|name| json_string(name)).collect();
         type_sets.push(format!("\"resource-type\":[{}]", names.join(",")));
     }
-    if rule.types & ResourceType::Subdocument.bit() != 0 {
-        type_sets.push(
-            "\"resource-type\":[\"document\"],\"load-context\":[\"child-frame\"]".to_owned(),
-        );
+    let pages = rule.types & ResourceType::Document.bit() != 0;
+    let frames = rule.types & ResourceType::Subdocument.bit() != 0;
+    let context = match (pages, frames) {
+        (true, true) => Some(""),
+        (true, false) => Some(",\"load-context\":[\"top-frame\"]"),
+        (false, true) => Some(",\"load-context\":[\"child-frame\"]"),
+        (false, false) => None,
+    };
+    if let Some(context) = context {
+        type_sets.push(format!("\"resource-type\":[\"document\"]{context}"));
     }
 
     let mut triggers = Vec::new();
@@ -283,6 +291,15 @@ fn page_triggers(rule: &Rule) -> Option<Vec<String>> {
         "{{\"url-filter\":\".*\",\"if-top-url\":[{}]{case}}}",
         pages.join(",")
     )])
+}
+
+/// Whether a pattern after `||` is a host name, perhaps ending with `^`.
+fn is_host_only(body: &[u8]) -> bool {
+    let host = body.strip_suffix(b"^").unwrap_or(body);
+    !host.is_empty()
+        && host
+            .iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-')
 }
 
 /// The characters that `^` matches, besides the end of the URL.
@@ -440,8 +457,9 @@ fn parse_line(line: &str) -> (Parsed, Option<Rule>) {
             ("first-party" | "1p", None, _) => rule.third_party = Some(negated),
             ("match-case", None, false) => rule.match_case = true,
             ("important", None, false) => rule.important = true,
-            ("all", None, false) => rule.types |= DEFAULT_TYPES,
+            ("all", None, false) => rule.types |= ALL_TYPES,
             ("document" | "doc", None, false) if exception => page_exception = true,
+            ("document" | "doc", None, false) => rule.types |= ResourceType::Document.bit(),
             ("domain" | "from", Some(domains), false) => {
                 for domain in domains.split('|') {
                     let (excluded, domain) = match domain.strip_prefix('~') {
@@ -463,7 +481,8 @@ fn parse_line(line: &str) -> (Parsed, Option<Rule>) {
             _ => return (Parsed::Unsupported, None),
         }
     }
-    if rule.types == 0 {
+    let typed = rule.types != 0;
+    if !typed {
         rule.types = DEFAULT_TYPES;
     }
     rule.types &= !excluded_types;
@@ -494,6 +513,10 @@ fn parse_line(line: &str) -> (Parsed, Option<Rule>) {
     } else {
         pattern.to_ascii_lowercase().into_bytes()
     };
+    // Pages on a host that a rule names, and nothing else, are blocked too.
+    if !typed && !page_exception && rule.anchor == Anchor::Host && is_host_only(&rule.body) {
+        rule.types |= ResourceType::Document.bit();
+    }
 
     let kind = match (exception, page_exception) {
         (false, _) => Parsed::Block,
@@ -552,6 +575,31 @@ mod tests {
         assert_eq!(rules.len(), 2);
         assert!(rules[0].contains(DEFAULT_TYPES_JSON));
         assert!(rules[1].contains(r#""resource-type":["document"],"load-context":["child-frame"]"#));
+    }
+
+    #[test]
+    fn host_only_rules_and_document_rules_cover_pages() {
+        let blocks_pages = |line: &str| {
+            converted(line).iter().any(|rule| {
+                rule.contains(r#""resource-type":["document"]"#) && !rule.contains("child-frame")
+            })
+        };
+        assert!(blocks_pages("||ads.example^"));
+        assert!(blocks_pages("||ads.example"));
+        assert!(blocks_pages("@@||ok.example^"));
+        assert!(blocks_pages("/promo/page$document"));
+        assert!(blocks_pages("||ads.example^$third-party"));
+        assert!(!blocks_pages("||ads.example^$image"));
+        assert!(!blocks_pages("||ads.example/banner^"));
+        assert!(!blocks_pages("||ads.*.example^"));
+        assert!(!blocks_pages("/ads/banner"));
+        assert!(!blocks_pages("||ads.example^$~document"));
+        assert!(converted("/promo/page$document")[0].contains(r#""load-context":["top-frame"]"#));
+        // Pages and frames together are documents anywhere.
+        let rules = converted("||ads.example^$document,subdocument");
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].contains(r#""resource-type":["document"]}"#));
+        assert_eq!(converted("||ads.example^$all").len(), 2);
     }
 
     #[test]

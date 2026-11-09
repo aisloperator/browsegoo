@@ -164,7 +164,7 @@ pub fn mark_compiled(cache_dir: &Path, converted: &Converted) -> io::Result<()> 
 }
 
 /// Bump this when `filter` converts lists differently, so that they're compiled again.
-const CONVERSION_VERSION: u32 = 1;
+const CONVERSION_VERSION: u32 = 2;
 
 /// Converts the cached copies of the enabled lists, and the user's own rules,
 /// and reports on every list, and on the user's rules as `USER_RULES_ID`.

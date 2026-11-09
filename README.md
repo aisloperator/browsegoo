@@ -32,6 +32,11 @@ No license is given.
   shield button's menu turns filtering off or on for the current tab, from its
   next page load, and opens the preferences, where lists are enabled and
   downloaded.
+- Whole pages are blocked too, as with uBlock Origin's strict blocking, by rules
+  that are just a host name, such as `||ads.example.com^`, and by rules with the
+  `$document` or `$all` option. Other rules only block what pages load. A
+  blocked page is replaced by one that says so, with a link that turns filtering
+  off for that tab and loads it.
 - Your own filter rules, in the same format, used along with the lists. They're
   edited in the Your Filter Rules window, from the main menu or the shield
   button's menu, and its Apply button saves them and starts using them, from
