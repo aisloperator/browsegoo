@@ -27,6 +27,7 @@ use crate::location::parse_location;
 use crate::location_bar::LocationBar;
 use crate::preferences::PreferencesWindow;
 use crate::site_data::SiteDataWindow;
+use crate::user_filters::UserFiltersWindow;
 
 const INITIAL_WIDTH: i32 = 1024;
 const INITIAL_HEIGHT: i32 = 768;
@@ -184,6 +185,7 @@ struct Browser {
     preferences: RefCell<Option<PreferencesWindow>>,
     bookmarks_editor: RefCell<Option<Rc<BookmarksEditor>>>,
     site_data: RefCell<Option<Rc<SiteDataWindow>>>,
+    user_filters: RefCell<Option<Rc<UserFiltersWindow>>>,
 }
 
 /// Opens the browser window at `start_url`.
@@ -237,6 +239,7 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
         preferences: RefCell::new(None),
         bookmarks_editor: RefCell::new(None),
         site_data: RefCell::new(None),
+        user_filters: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
 
@@ -271,6 +274,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Bookmarks"), Some("win.edit-bookmarks"));
     main_menu.append(Some("Cookies and Site Data"), Some("win.site-data"));
+    main_menu.append(Some("Your Filter Rules"), Some("win.user-filters"));
     main_menu.append(Some("Preferences"), Some("win.preferences"));
     main_menu.append(Some("About BrowseGoo"), Some("win.about"));
     let main_menu_button = gtk::MenuButton::builder()
@@ -281,6 +285,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
 
     let filter_menu = gio::Menu::new();
     filter_menu.append(Some("Filter This Tab"), Some("win.filter-tab"));
+    filter_menu.append(Some("Your Filter Rules"), Some("win.user-filters"));
     filter_menu.append(Some("Preferences"), Some("win.preferences"));
     let filter_button = gtk::MenuButton::builder()
         .icon_name("security-high-symbolic")
@@ -825,6 +830,7 @@ impl Browser {
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
         add_action("site-data", Browser::show_site_data);
+        add_action("user-filters", Browser::show_user_filters);
         add_action("edit-bookmarks", |_| {
             // The window needs the shared handle, rather than a borrowed one.
             if let Some(browser) = current_browser() {
@@ -903,6 +909,34 @@ impl Browser {
         if let Some(editor) = editor {
             let items = self.bookmarks.borrow().items().to_vec();
             editor.show_bookmarks(&items);
+        }
+    }
+
+    fn show_user_filters(&self) {
+        if self.user_filters.borrow().is_none() {
+            let rules = filter_lists::load_user_rules(&self.dirs.config)
+                .map_err(|error| error.to_string());
+            let window = UserFiltersWindow::new(&self.widgets.window, rules, |text| {
+                let Some(browser) = current_browser() else {
+                    return Ok(());
+                };
+                filter_lists::save_user_rules(&browser.dirs.config, text)
+                    .map_err(|error| format!("Your rules couldn't be saved: {error}"))?;
+                browser.reload_filters();
+                Ok(())
+            });
+            self.user_filters.replace(Some(window));
+            self.show_user_filters_status();
+        }
+        if let Some(window) = self.user_filters.borrow().as_ref() {
+            window.present();
+        }
+    }
+
+    fn show_user_filters_status(&self) {
+        if let Some(window) = self.user_filters.borrow().as_ref() {
+            let statuses = self.list_statuses.borrow();
+            window.show_status(statuses.get(filter_lists::USER_RULES_ID));
         }
     }
 
@@ -1013,14 +1047,17 @@ impl Browser {
         self.filter_generation.set(generation);
         let enabled = self.filter_settings.borrow().enabled_lists();
         let cache_dir = self.dirs.cache.clone();
+        let config_dir = self.dirs.config.clone();
         let store = self.filter_store.clone();
         glib::spawn_future_local(async move {
             let is_current = || {
                 current_browser().is_some_and(|browser| browser.filter_generation.get() == generation)
             };
             let directory = cache_dir.clone();
-            let converted =
-                gio::spawn_blocking(move || filter_lists::convert_lists(&directory, &enabled)).await;
+            let converted = gio::spawn_blocking(move || {
+                filter_lists::convert_lists(&directory, &config_dir, &enabled)
+            })
+            .await;
             let Ok((converted, mut statuses)) = converted else {
                 if let Some(browser) = current_browser() {
                     browser.load_start_page();
@@ -1033,7 +1070,7 @@ impl Browser {
 
             let mut filters = Vec::new();
             for list in converted {
-                let id = list.list.id;
+                let id = list.id;
                 let compiled = if filter_lists::is_compiled(&cache_dir, &list) {
                     store.load_future(id).await.ok()
                 } else {
@@ -1077,6 +1114,7 @@ impl Browser {
             if let Some(preferences) = browser.preferences.borrow().as_ref() {
                 preferences.show_statuses(&browser.list_statuses.borrow());
             }
+            browser.show_user_filters_status();
             browser.update_filter_button();
             browser.load_start_page();
         });

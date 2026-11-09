@@ -32,6 +32,11 @@ No license is given.
   shield button's menu turns filtering off or on for the current tab, from its
   next page load, and opens the preferences, where lists are enabled and
   downloaded.
+- Your own filter rules, in the same format, used along with the lists. They're
+  edited in the Your Filter Rules window, from the main menu or the shield
+  button's menu, and its Apply button saves them and starts using them, from
+  each tab's next page load. The window says how many rules are used, and which
+  lines aren't applied, such as element hiding rules.
 - Cookies, and what sites store, such as with `localStorage`, persist between
   runs.
 - A Cookies and Site Data window, from the main menu, which lists each cookie,
@@ -77,6 +82,13 @@ versions in `compiled/` there. Lists are only downloaded with the Update Lists
 button in the preferences, so filtering does nothing until then. Compiling the
 four lists offered took about 15 seconds, and is only done again when a list
 changes. The compiled lists are large: about 90 MB for all four.
+
+Your own rules are in `~/.config/browsegoo/user_filters.txt`. WebKit applies each
+list on its own, and an exception in one doesn't stop another from blocking, so
+your exceptions (rules starting with `@@`) are also added to each enabled list.
+Changing them compiles the lists again, which takes a while, but changing your
+other rules doesn't. Your blocking rules block even what a list makes an
+exception for.
 
 ## Building
 

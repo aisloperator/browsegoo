@@ -108,9 +108,31 @@ pub fn cache_path(cache_dir: &Path, list: &FilterList) -> PathBuf {
     cache_dir.join(format!("{}.txt", list.id))
 }
 
-/// A downloaded list, converted for WebKit.
+/// The ID of the user's own rules, which are converted and compiled like a list.
+pub const USER_RULES_ID: &str = "user";
+
+/// Where the user's own rules are, in the lists' format.
+pub fn user_rules_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("user_filters.txt")
+}
+
+/// The user's own rules, which are none if there's no file for them yet.
+pub fn load_user_rules(config_dir: &Path) -> io::Result<String> {
+    match fs::read_to_string(user_rules_path(config_dir)) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        result => result,
+    }
+}
+
+pub fn save_user_rules(config_dir: &Path, text: &str) -> io::Result<()> {
+    fs::create_dir_all(config_dir)?;
+    write_atomically(&user_rules_path(config_dir), text.as_bytes())
+}
+
+/// A downloaded list, or the user's rules, converted for WebKit.
 pub struct Converted {
-    pub list: &'static FilterList,
+    /// The list's ID, or `USER_RULES_ID`.
+    pub id: &'static str,
     /// Changes with the list and with how it's converted, so that it's only
     /// compiled again when needed.
     pub fingerprint: String,
@@ -122,13 +144,13 @@ pub fn compiled_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("compiled")
 }
 
-fn fingerprint_path(cache_dir: &Path, list: &FilterList) -> PathBuf {
-    compiled_dir(cache_dir).join(format!("{}.fingerprint", list.id))
+fn fingerprint_path(cache_dir: &Path, id: &str) -> PathBuf {
+    compiled_dir(cache_dir).join(format!("{id}.fingerprint"))
 }
 
 /// Whether the compiled list in WebKit's store is of this conversion.
 pub fn is_compiled(cache_dir: &Path, converted: &Converted) -> bool {
-    fs::read_to_string(fingerprint_path(cache_dir, converted.list))
+    fs::read_to_string(fingerprint_path(cache_dir, converted.id))
         .is_ok_and(|fingerprint| fingerprint == converted.fingerprint)
 }
 
@@ -136,7 +158,7 @@ pub fn is_compiled(cache_dir: &Path, converted: &Converted) -> bool {
 pub fn mark_compiled(cache_dir: &Path, converted: &Converted) -> io::Result<()> {
     fs::create_dir_all(compiled_dir(cache_dir))?;
     write_atomically(
-        &fingerprint_path(cache_dir, converted.list),
+        &fingerprint_path(cache_dir, converted.id),
         converted.fingerprint.as_bytes(),
     )
 }
@@ -144,13 +166,21 @@ pub fn mark_compiled(cache_dir: &Path, converted: &Converted) -> io::Result<()> 
 /// Bump this when `filter` converts lists differently, so that they're compiled again.
 const CONVERSION_VERSION: u32 = 1;
 
-/// Converts the cached copies of the enabled lists, and reports on every list.
+/// Converts the cached copies of the enabled lists, and the user's own rules,
+/// and reports on every list, and on the user's rules as `USER_RULES_ID`.
 pub fn convert_lists(
     cache_dir: &Path,
+    config_dir: &Path,
     enabled: &[&FilterList],
 ) -> (Vec<Converted>, BTreeMap<&'static str, ListStatus>) {
     let mut converted = Vec::new();
     let mut statuses = BTreeMap::new();
+    let user_rules = load_user_rules(config_dir);
+    let user_exceptions = match &user_rules {
+        Ok(text) => filter::exception_rules(text),
+        Err(_) => String::new(),
+    };
+    let (_, exception_stats) = filter::convert_list(&user_exceptions);
     for list in &LISTS {
         let path = cache_path(cache_dir, list);
         let mut status = ListStatus {
@@ -160,11 +190,18 @@ pub fn convert_lists(
         };
         if enabled.iter().any(|enabled| enabled.id == list.id) {
             match fs::read_to_string(&path) {
-                Ok(text) => {
-                    let (json, stats) = filter::convert_list(&text);
+                Ok(mut text) => {
+                    if !user_exceptions.is_empty() {
+                        text.push('\n');
+                        text.push_str(&user_exceptions);
+                    }
+                    let (json, mut stats) = filter::convert_list(&text);
+                    // The list is counted without the user's exceptions.
+                    stats.rules -= exception_stats.rules;
+                    stats.unsupported -= exception_stats.unsupported;
                     status.stats = Some(stats);
                     converted.push(Converted {
-                        list,
+                        id: list.id,
                         fingerprint: format!("{:016x}", fingerprint(&text)),
                         json,
                     });
@@ -175,6 +212,24 @@ pub fn convert_lists(
         }
         statuses.insert(list.id, status);
     }
+
+    let mut status = ListStatus::default();
+    match user_rules {
+        Ok(text) => {
+            let (json, stats) = filter::convert_list(&text);
+            status.stats = Some(stats);
+            // WebKit has no use for a list without rules.
+            if stats.rules > 0 {
+                converted.push(Converted {
+                    id: USER_RULES_ID,
+                    fingerprint: format!("{:016x}", fingerprint(&text)),
+                    json,
+                });
+            }
+        }
+        Err(error) => status.problem = Some(format!("Could not read them: {error}")),
+    }
+    statuses.insert(USER_RULES_ID, status);
     (converted, statuses)
 }
 
@@ -261,9 +316,10 @@ mod tests {
         )
         .unwrap();
 
-        let (converted, statuses) = convert_lists(&cache, &[&LISTS[0], &LISTS[1]]);
+        let config = temporary_dir("no-user-rules");
+        let (converted, statuses) = convert_lists(&cache, &config, &[&LISTS[0], &LISTS[1]]);
         assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].list.id, "easylist");
+        assert_eq!(converted[0].id, "easylist");
         assert!(!is_compiled(&cache, &converted[0]));
         mark_compiled(&cache, &converted[0]).unwrap();
         assert!(is_compiled(&cache, &converted[0]));
@@ -272,6 +328,28 @@ mod tests {
         assert!(statuses["easyprivacy"].downloaded.is_none());
         assert!(statuses["peter-lowe"].downloaded.is_some());
         assert!(statuses["peter-lowe"].stats.is_none());
+        assert_eq!(statuses[USER_RULES_ID].stats.map(|stats| stats.rules), Some(0));
+    }
+
+    #[test]
+    fn user_rules_are_converted_after_the_lists() {
+        let cache = temporary_dir("user-cache");
+        let config = temporary_dir("user-config");
+        fs::write(cache_path(&cache, &LISTS[0]), "[Adblock Plus 2.0]\n||a.example^\n").unwrap();
+        save_user_rules(&config, "! Mine\n||mine.example^\n@@||a.example^\n").unwrap();
+        assert!(load_user_rules(&config).unwrap().contains("mine.example"));
+
+        let (converted, statuses) = convert_lists(&cache, &config, &[&LISTS[0]]);
+        let ids: Vec<_> = converted.iter().map(|converted| converted.id).collect();
+        assert_eq!(ids, ["easylist", USER_RULES_ID]);
+        assert_eq!(statuses[USER_RULES_ID].stats.map(|stats| stats.rules), Some(2));
+        // The list has the user's exception, but isn't counted with it.
+        assert!(converted[0].json.contains("ignore-previous-rules"));
+        assert_eq!(statuses["easylist"].stats.map(|stats| stats.rules), Some(1));
+
+        save_user_rules(&config, "! Only a comment\n").unwrap();
+        let (converted, _) = convert_lists(&cache, &config, &[&LISTS[0]]);
+        assert_eq!(converted.len(), 1);
     }
 
     #[test]

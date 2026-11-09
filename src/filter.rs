@@ -113,39 +113,90 @@ pub struct ListStats {
     pub unsupported: usize,
 }
 
+/// What one line of a list amounts to.
+enum Line {
+    /// Comments, blank lines and the header, which aren't rules.
+    Other,
+    /// Rules for something other than requests, such as element hiding.
+    NotNetwork,
+    /// Rules for requests that WebKit can't apply as they mean.
+    Unsupported,
+    /// A rule's WebKit rules, which go in the given group.
+    Rules(usize, Vec<String>),
+}
+
+fn convert_line(line: &str) -> Line {
+    let (kind, rule) = parse_line(line);
+    let Some(rule) = rule else {
+        let trimmed = line.trim();
+        return match kind {
+            Parsed::Unsupported => Line::Unsupported,
+            _ if trimmed.is_empty() || trimmed.starts_with('!') || trimmed.starts_with('[') => {
+                Line::Other
+            }
+            _ => Line::NotNetwork,
+        };
+    };
+    let (group, triggers, action) = match kind {
+        Parsed::Block if rule.important => (2, url_triggers(&rule), "block"),
+        Parsed::Block => (0, url_triggers(&rule), "block"),
+        Parsed::Exception => (1, url_triggers(&rule), "ignore-previous-rules"),
+        Parsed::PageException => (3, page_triggers(&rule), "ignore-previous-rules"),
+        Parsed::NotNetworkRule | Parsed::Unsupported => unreachable!("these have no rule"),
+    };
+    let Some(triggers) = triggers else {
+        return Line::Unsupported;
+    };
+    let rules = triggers
+        .into_iter()
+        .map(|trigger| format!("{{\"trigger\":{trigger},\"action\":{{\"type\":\"{action}\"}}}}"))
+        .collect();
+    Line::Rules(group, rules)
+}
+
 /// Converts a filter list into the JSON of a WebKit content blocker.
 pub fn convert_list(text: &str) -> (String, ListStats) {
     let mut stats = ListStats::default();
     // In the order WebKit needs them, as described at the top.
     let mut groups: [Vec<String>; 4] = Default::default();
     for line in text.lines() {
-        let (kind, rule) = parse_line(line);
-        let Some(rule) = rule else {
-            if kind == Parsed::Unsupported {
-                stats.unsupported += 1;
+        match convert_line(line) {
+            Line::Rules(group, rules) => {
+                stats.rules += 1;
+                groups[group].extend(rules);
             }
-            continue;
-        };
-        let (group, triggers, action) = match kind {
-            Parsed::Block if rule.important => (2, url_triggers(&rule), "block"),
-            Parsed::Block => (0, url_triggers(&rule), "block"),
-            Parsed::Exception => (1, url_triggers(&rule), "ignore-previous-rules"),
-            Parsed::PageException => (3, page_triggers(&rule), "ignore-previous-rules"),
-            Parsed::NotNetworkRule | Parsed::Unsupported => unreachable!("these have no rule"),
-        };
-        let Some(triggers) = triggers else {
-            stats.unsupported += 1;
-            continue;
-        };
-        stats.rules += 1;
-        for trigger in triggers {
-            groups[group].push(format!(
-                "{{\"trigger\":{trigger},\"action\":{{\"type\":\"{action}\"}}}}"
-            ));
+            Line::Unsupported => stats.unsupported += 1,
+            // Not counted, as lists have many of them for other purposes.
+            Line::NotNetwork | Line::Other => {}
         }
     }
     let rules: Vec<String> = groups.into_iter().flatten().collect();
     (format!("[{}]", rules.join(",\n")), stats)
+}
+
+/// The exception rules in `text`. WebKit applies each list on its own, and an
+/// exception in one doesn't stop another from blocking, so the user's
+/// exceptions are added to every list too.
+pub fn exception_rules(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            matches!(
+                parse_line(line),
+                (Parsed::Exception | Parsed::PageException, Some(_))
+            )
+        })
+        .map(|line| format!("{}\n", line.trim()))
+        .collect()
+}
+
+/// The numbers of the lines, from 1, that are rules but aren't applied,
+/// including element hiding rules.
+pub fn lines_not_applied(text: &str) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| matches!(convert_line(line), Line::NotNetwork | Line::Unsupported))
+        .map(|(index, _)| index + 1)
+        .collect()
 }
 
 /// The triggers for a rule about requests, or `None` if WebKit can't express it.
@@ -568,5 +619,20 @@ mod tests {
         let (json, _) = convert_list("||a.example^\n@@||a.example/ok^");
         assert!(json.starts_with("[{") && json.ends_with("}]"));
         assert_eq!(convert_list("! nothing").0, "[]");
+    }
+
+    #[test]
+    fn lines_not_applied_include_element_hiding() {
+        let text = "! A comment\n\n||ads.example^\nexample.com##.ad\n/a[0-9]/\n||ok.example^$image";
+        assert_eq!(lines_not_applied(text), [4, 5]);
+    }
+
+    #[test]
+    fn only_exceptions_go_in_every_list() {
+        let text = "||ads.example^\n@@||ok.example^\n  @@||site.example^$document\n! @@||no^";
+        assert_eq!(
+            exception_rules(text),
+            "@@||ok.example^\n@@||site.example^$document\n"
+        );
     }
 }

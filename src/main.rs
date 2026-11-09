@@ -12,6 +12,7 @@ mod location;
 mod location_bar;
 mod preferences;
 mod site_data;
+mod user_filters;
 
 use std::process::ExitCode;
 use std::{env, fs};
