@@ -1,16 +1,20 @@
-//! Blocks network requests with the URL filter rules of Adblock Plus style
-//! lists, such as EasyList.
+//! Converts the URL filter rules of Adblock Plus style lists, such as EasyList,
+//! the format uBlock Origin also uses, into WebKit content blocker rules.
 //!
-//! This only does the network part of those lists, and only the common parts of
-//! their syntax. Rules that it can't apply correctly are skipped rather than
-//! approximated: regular expressions, element hiding, scriptlets, redirects, and
-//! options it doesn't know.
-
-use std::collections::HashMap;
+//! WebKit applies its rules itself, in a compiled form, so this only has to
+//! translate them. It does the network part of the lists, and only the common
+//! parts of their syntax. Rules that can't be translated correctly are skipped
+//! rather than approximated: regular expressions, element hiding, scriptlets,
+//! redirects, and options it doesn't know.
+//!
+//! WebKit applies rules in order, and an `ignore-previous-rules` rule undoes
+//! the ones before it. So blocking rules come first, then exceptions, then
+//! `$important` blocking rules, which exceptions don't undo, and last the
+//! exceptions that turn filtering off on whole pages.
 
 /// The kinds of resource that filter rules can be limited to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResourceType {
+enum ResourceType {
     Document,
     Subdocument,
     Script,
@@ -26,26 +30,46 @@ pub enum ResourceType {
 }
 
 impl ResourceType {
+    const ALL: [ResourceType; 12] = [
+        ResourceType::Document,
+        ResourceType::Subdocument,
+        ResourceType::Script,
+        ResourceType::Stylesheet,
+        ResourceType::Image,
+        ResourceType::Font,
+        ResourceType::Media,
+        ResourceType::Object,
+        ResourceType::XmlHttpRequest,
+        ResourceType::Ping,
+        ResourceType::WebSocket,
+        ResourceType::Other,
+    ];
+
     fn bit(self) -> u16 {
         1 << (self as u16)
+    }
+
+    /// WebKit's name for this type of resource, for those other than documents.
+    fn webkit_name(self) -> Option<&'static str> {
+        match self {
+            ResourceType::Document | ResourceType::Subdocument => None,
+            ResourceType::Script => Some("script"),
+            ResourceType::Stylesheet => Some("style-sheet"),
+            ResourceType::Image => Some("image"),
+            ResourceType::Font => Some("font"),
+            ResourceType::Media => Some("media"),
+            // WebKit has no plugins, so what's left of these is "other".
+            ResourceType::Object | ResourceType::Other => Some("other"),
+            ResourceType::XmlHttpRequest => Some("fetch"),
+            ResourceType::Ping => Some("ping"),
+            ResourceType::WebSocket => Some("websocket"),
+        }
     }
 }
 
 const ALL_TYPES: u16 = (1 << 12) - 1;
 /// Rules with no type options apply to everything but whole pages.
 const DEFAULT_TYPES: u16 = ALL_TYPES & !(1 << ResourceType::Document as u16);
-
-/// A request that might be blocked.
-pub struct Request<'a> {
-    pub url: &'a str,
-    /// The host of the page that made the request, if known.
-    pub page_host: Option<&'a str>,
-    /// The URL of the page that made the request, if known.
-    pub page_url: Option<&'a str>,
-    /// Whether the request is to a different site than the page.
-    pub third_party: bool,
-    pub resource_type: ResourceType,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Anchor {
@@ -82,52 +106,6 @@ enum Parsed {
     Unsupported,
 }
 
-#[derive(Default)]
-struct RuleSet {
-    rules: Vec<Rule>,
-    by_token: HashMap<u64, Vec<u32>>,
-    /// Rules with no usable token, which have to be tried for every request.
-    untokened: Vec<u32>,
-}
-
-impl RuleSet {
-    fn add(&mut self, rule: Rule) {
-        let index = self.rules.len() as u32;
-        match best_token(&rule) {
-            Some(token) => self.by_token.entry(token).or_default().push(index),
-            None => self.untokened.push(index),
-        }
-        self.rules.push(rule);
-    }
-
-    /// Returns whether any rule matches, and whether any of those is important.
-    fn find(&self, request: &Request, lower_url: &[u8], tokens: &[u64]) -> Option<bool> {
-        let mut found = None;
-        let candidates = tokens
-            .iter()
-            .filter_map(|token| self.by_token.get(token))
-            .flatten()
-            .chain(self.untokened.iter());
-        for &index in candidates {
-            let rule = &self.rules[index as usize];
-            if rule.applies_to(request) && rule.matches_url(request.url.as_bytes(), lower_url) {
-                if rule.important {
-                    return Some(true);
-                }
-                found = Some(false);
-            }
-        }
-        found
-    }
-}
-
-#[derive(Default)]
-pub struct Engine {
-    blocking: RuleSet,
-    exceptions: RuleSet,
-    page_exceptions: RuleSet,
-}
-
 /// How many lines of a list were used.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ListStats {
@@ -135,244 +113,201 @@ pub struct ListStats {
     pub unsupported: usize,
 }
 
-impl Engine {
-    pub fn rule_count(&self) -> usize {
-        self.blocking.rules.len() + self.exceptions.rules.len() + self.page_exceptions.rules.len()
-    }
-
-    /// Adds the network rules of a filter list.
-    pub fn add_list(&mut self, text: &str) -> ListStats {
-        let mut stats = ListStats::default();
-        for line in text.lines() {
-            let (kind, rule) = parse_line(line);
-            let set = match kind {
-                Parsed::Block => &mut self.blocking,
-                Parsed::Exception => &mut self.exceptions,
-                Parsed::PageException => &mut self.page_exceptions,
-                Parsed::NotNetworkRule => continue,
-                Parsed::Unsupported => {
-                    stats.unsupported += 1;
-                    continue;
-                }
-            };
-            set.add(rule.expect("every kind of network rule has a rule"));
-            stats.rules += 1;
-        }
-        stats
-    }
-
-    pub fn should_block(&self, request: &Request) -> bool {
-        if self.is_page_excepted(request) {
-            return false;
-        }
-        let lower_url = request.url.to_ascii_lowercase().into_bytes();
-        let tokens = url_tokens(&lower_url);
-        match self.blocking.find(request, &lower_url, &tokens) {
-            None => false,
-            Some(true) => true,
-            Some(false) => self.exceptions.find(request, &lower_url, &tokens).is_none(),
-        }
-    }
-
-    fn is_page_excepted(&self, request: &Request) -> bool {
-        let (Some(page_url), Some(page_host)) = (request.page_url, request.page_host) else {
-            return false;
+/// Converts a filter list into the JSON of a WebKit content blocker.
+pub fn convert_list(text: &str) -> (String, ListStats) {
+    let mut stats = ListStats::default();
+    // In the order WebKit needs them, as described at the top.
+    let mut groups: [Vec<String>; 4] = Default::default();
+    for line in text.lines() {
+        let (kind, rule) = parse_line(line);
+        let Some(rule) = rule else {
+            if kind == Parsed::Unsupported {
+                stats.unsupported += 1;
+            }
+            continue;
         };
-        if self.page_exceptions.rules.is_empty() {
-            return false;
-        }
-        let page = Request {
-            url: page_url,
-            page_host: Some(page_host),
-            page_url: Some(page_url),
-            third_party: false,
-            resource_type: ResourceType::Document,
+        let (group, triggers, action) = match kind {
+            Parsed::Block if rule.important => (2, url_triggers(&rule), "block"),
+            Parsed::Block => (0, url_triggers(&rule), "block"),
+            Parsed::Exception => (1, url_triggers(&rule), "ignore-previous-rules"),
+            Parsed::PageException => (3, page_triggers(&rule), "ignore-previous-rules"),
+            Parsed::NotNetworkRule | Parsed::Unsupported => unreachable!("these have no rule"),
         };
-        let lower_url = page_url.to_ascii_lowercase().into_bytes();
-        let tokens = url_tokens(&lower_url);
-        self.page_exceptions
-            .find(&page, &lower_url, &tokens)
-            .is_some()
-    }
-}
-
-impl Rule {
-    fn applies_to(&self, request: &Request) -> bool {
-        if self.types & request.resource_type.bit() == 0 {
-            return false;
-        }
-        if self
-            .third_party
-            .is_some_and(|third_party| third_party != request.third_party)
-        {
-            return false;
-        }
-        if !self.include_domains.is_empty() || !self.exclude_domains.is_empty() {
-            let Some(page_host) = request.page_host else {
-                return self.include_domains.is_empty();
-            };
-            let page_host = page_host.to_ascii_lowercase();
-            let on = |domain: &String| is_same_or_subdomain(&page_host, domain);
-            if self.exclude_domains.iter().any(on) {
-                return false;
-            }
-            if !self.include_domains.is_empty() && !self.include_domains.iter().any(on) {
-                return false;
-            }
-        }
-        true
-    }
-
-    fn matches_url(&self, url: &[u8], lower_url: &[u8]) -> bool {
-        let url = if self.match_case { url } else { lower_url };
-        match self.anchor {
-            Anchor::None => glob(&self.body, url, true, self.end_anchor),
-            Anchor::Start => glob(&self.body, url, false, self.end_anchor),
-            Anchor::Host => {
-                let Some((start, end)) = host_range(url) else {
-                    return false;
-                };
-                let label_starts = std::iter::once(start)
-                    .chain((start..end).filter(|&i| url[i] == b'.').map(|i| i + 1));
-                label_starts
-                    .into_iter()
-                    .any(|i| glob(&self.body, &url[i..], false, self.end_anchor))
-            }
+        let Some(triggers) = triggers else {
+            stats.unsupported += 1;
+            continue;
+        };
+        stats.rules += 1;
+        for trigger in triggers {
+            groups[group].push(format!(
+                "{{\"trigger\":{trigger},\"action\":{{\"type\":\"{action}\"}}}}"
+            ));
         }
     }
+    let rules: Vec<String> = groups.into_iter().flatten().collect();
+    (format!("[{}]", rules.join(",\n")), stats)
 }
 
-fn is_same_or_subdomain(host: &str, domain: &str) -> bool {
-    host == domain
-        || host
-            .strip_suffix(domain)
-            .is_some_and(|prefix| prefix.ends_with('.'))
+/// The triggers for a rule about requests, or `None` if WebKit can't express it.
+fn url_triggers(rule: &Rule) -> Option<Vec<String>> {
+    // WebKit allows only one of these in a trigger.
+    if !rule.include_domains.is_empty() && !rule.exclude_domains.is_empty() {
+        return None;
+    }
+    let mut conditions = Vec::new();
+    if rule.match_case {
+        conditions.push("\"url-filter-is-case-sensitive\":true".to_owned());
+    }
+    match rule.third_party {
+        Some(true) => conditions.push("\"load-type\":[\"third-party\"]".to_owned()),
+        Some(false) => conditions.push("\"load-type\":[\"first-party\"]".to_owned()),
+        None => {}
+    }
+    for (name, domains) in [
+        ("if-domain", &rule.include_domains),
+        ("unless-domain", &rule.exclude_domains),
+    ] {
+        if !domains.is_empty() {
+            let domains: Vec<String> = domains
+                .iter()
+                .map(|domain| json_string(&format!("*{domain}")))
+                .collect();
+            conditions.push(format!("\"{name}\":[{}]", domains.join(",")));
+        }
+    }
+
+    // Documents loading in frames are a type of their own in these lists, but
+    // in WebKit they're documents loading in a child frame.
+    let mut type_sets = Vec::new();
+    let mut names: Vec<&str> = Vec::new();
+    for kind in ResourceType::ALL {
+        if let Some(name) = kind.webkit_name().filter(|_| rule.types & kind.bit() != 0) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    if !names.is_empty() {
+        let names: Vec<String> = names.iter().map(|name| json_string(name)).collect();
+        type_sets.push(format!("\"resource-type\":[{}]", names.join(",")));
+    }
+    if rule.types & ResourceType::Subdocument.bit() != 0 {
+        type_sets.push(
+            "\"resource-type\":[\"document\"],\"load-context\":[\"child-frame\"]".to_owned(),
+        );
+    }
+
+    let mut triggers = Vec::new();
+    for filter in url_filters(rule)? {
+        for types in &type_sets {
+            let mut parts = vec![format!("\"url-filter\":{}", json_string(&filter))];
+            parts.push(types.clone());
+            parts.extend(conditions.iter().cloned());
+            triggers.push(format!("{{{}}}", parts.join(",")));
+        }
+    }
+    Some(triggers)
 }
 
-/// Finds the host in a URL, as byte offsets.
-fn host_range(url: &[u8]) -> Option<(usize, usize)> {
-    let scheme_end = url.windows(3).position(|window| window == b"://")?;
-    let mut start = scheme_end + 3;
-    let authority_end = url[start..]
+/// The triggers for an exception that turns off filtering on the pages whose
+/// URL matches the rule.
+fn page_triggers(rule: &Rule) -> Option<Vec<String>> {
+    // WebKit can't combine a page URL condition with these.
+    if !rule.include_domains.is_empty()
+        || !rule.exclude_domains.is_empty()
+        || rule.third_party.is_some()
+    {
+        return None;
+    }
+    let pages: Vec<String> = url_filters(rule)?
         .iter()
-        .position(|&c| matches!(c, b'/' | b'?' | b'#'))
-        .map_or(url.len(), |i| start + i);
-    if let Some(at) = url[start..authority_end].iter().rposition(|&c| c == b'@') {
-        start += at + 1;
-    }
-    let end = if url.get(start) == Some(&b'[') {
-        url[start..authority_end]
-            .iter()
-            .position(|&c| c == b']')
-            .map_or(authority_end, |i| start + i + 1)
+        .map(|filter| json_string(filter))
+        .collect();
+    let case = if rule.match_case {
+        ",\"top-url-filter-is-case-sensitive\":true"
     } else {
-        url[start..authority_end]
-            .iter()
-            .position(|&c| c == b':')
-            .map_or(authority_end, |i| start + i)
+        ""
     };
-    Some((start, end))
+    Some(vec![format!(
+        "{{\"url-filter\":\".*\",\"if-top-url\":[{}]{case}}}",
+        pages.join(",")
+    )])
 }
 
 /// The characters that `^` matches, besides the end of the URL.
-fn is_separator(c: u8) -> bool {
-    !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.' | b'%'))
-}
+const SEPARATOR: &str = "[^a-zA-Z0-9_.%-]";
 
-/// Matches a pattern with `*` and `^` wildcards against `text`, which it must
-/// match from the start, unless `any_start`.
-fn glob(pattern: &[u8], text: &[u8], any_start: bool, to_end: bool) -> bool {
-    let (mut p, mut t) = (0, 0);
-    // Where to resume after the last `*`, if a later part of the pattern fails.
-    let mut star: Option<(usize, usize)> = any_start.then_some((0, 0));
-    loop {
-        if p == pattern.len() {
-            if !to_end || t == text.len() {
-                return true;
+/// Translates a rule's pattern into the regular expressions WebKit matches URLs
+/// with, which have no alternatives. So a `^` at the end, which also matches
+/// the end of the URL, takes two expressions, except after a host name, which
+/// in a URL is always followed by something else.
+fn url_filters(rule: &Rule) -> Option<Vec<String>> {
+    let mut body = rule.body.as_slice();
+    let mut start = match rule.anchor {
+        Anchor::None => {
+            while let [b'*', rest @ ..] = body {
+                body = rest;
             }
+            String::new()
+        }
+        Anchor::Start => "^".to_owned(),
+        Anchor::Host => "^[a-z][a-z0-9.+-]*://([^/:@?#]*\\.)?".to_owned(),
+    };
+    if !rule.end_anchor {
+        while let [rest @ .., b'*'] = body {
+            body = rest;
+        }
+    }
+    let ends_with_separator = !rule.end_anchor && body.last() == Some(&b'^');
+    if ends_with_separator {
+        body = &body[..body.len() - 1];
+    }
+
+    for &c in body {
+        match c {
+            b'*' => start.push_str(".*"),
+            b'^' => start.push_str(SEPARATOR),
+            b'\\' | b'.' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'|' | b'$' => {
+                start.push('\\');
+                start.push(c as char);
+            }
+            // WebKit only takes ASCII, and nothing else is in a URL anyway.
+            32..=126 => start.push(c as char),
+            _ => return None,
+        }
+    }
+    let filter = start;
+
+    if rule.end_anchor {
+        return Some(vec![format!("{filter}$")]);
+    }
+    if !ends_with_separator {
+        return Some(vec![if filter.is_empty() {
+            ".*".to_owned()
         } else {
-            let c = pattern[p];
-            if c == b'*' {
-                p += 1;
-                star = Some((p, t));
-                continue;
-            }
-            if t < text.len() && (c == text[t] || (c == b'^' && is_separator(text[t]))) {
-                p += 1;
-                t += 1;
-                continue;
-            }
-            if c == b'^' && t == text.len() {
-                p += 1;
-                continue;
-            }
-        }
-        match star {
-            Some((star_p, star_t)) if star_t < text.len() => {
-                star = Some((star_p, star_t + 1));
-                p = star_p;
-                t = star_t + 1;
-            }
-            _ => return false,
-        }
+            filter
+        }]);
+    }
+    let after_host = rule.anchor == Anchor::Host && !body.contains(&b'/');
+    if after_host {
+        Some(vec![format!("{filter}{SEPARATOR}")])
+    } else {
+        Some(vec![format!("{filter}{SEPARATOR}"), format!("{filter}$")])
     }
 }
 
-fn hash_token(token: &[u8]) -> u64 {
-    // FNV-1a.
-    token.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &c| {
-        (hash ^ u64::from(c)).wrapping_mul(0x0000_0100_0000_01b3)
-    })
-}
-
-fn url_tokens(lower_url: &[u8]) -> Vec<u64> {
-    lower_url
-        .split(|c| !c.is_ascii_alphanumeric())
-        .filter(|token| !token.is_empty())
-        .map(hash_token)
-        .collect()
-}
-
-/// Tokens so common in URLs that they're poor at narrowing down rules.
-const COMMON_TOKENS: [&[u8]; 9] = [
-    b"http", b"https", b"www", b"com", b"net", b"org", b"js", b"html", b"php",
-];
-
-/// Picks a word from the rule that any URL it matches must contain as a whole
-/// token, for looking the rule up by.
-fn best_token(rule: &Rule) -> Option<u64> {
-    let body = &rule.body;
-    let mut best: Option<(bool, usize, &[u8])> = None;
-    let mut start = 0;
-    while start < body.len() {
-        if !body[start].is_ascii_alphanumeric() {
-            start += 1;
-            continue;
+/// A JSON string. The text is always ASCII here, from `url_filters` or domains.
+fn json_string(text: &str) -> String {
+    let mut json = String::with_capacity(text.len() + 2);
+    json.push('"');
+    for c in text.chars() {
+        if matches!(c, '"' | '\\') {
+            json.push('\\');
         }
-        let end = body[start..]
-            .iter()
-            .position(|c| !c.is_ascii_alphanumeric())
-            .map_or(body.len(), |i| start + i);
-        let bounded_before = if start == 0 {
-            rule.anchor != Anchor::None
-        } else {
-            body[start - 1] != b'*'
-        };
-        let bounded_after = if end == body.len() {
-            rule.end_anchor
-        } else {
-            body[end] != b'*'
-        };
-        if bounded_before && bounded_after {
-            let token = &body[start..end];
-            let rank = (!COMMON_TOKENS.contains(&token), token.len(), token);
-            if best.is_none_or(|best| (rank.0, rank.1) > (best.0, best.1)) {
-                best = Some(rank);
-            }
-        }
-        start = end;
+        json.push(c);
     }
-    best.map(|(_, _, token)| hash_token(&token.to_ascii_lowercase()))
+    json.push('"');
+    json
 }
 
 fn parse_line(line: &str) -> (Parsed, Option<Rule>) {
@@ -517,330 +452,121 @@ fn parse_line(line: &str) -> (Parsed, Option<Rule>) {
     (kind, Some(rule))
 }
 
-/// The part of a host name that a site registered, such as `example.co.uk` for
-/// `www.example.co.uk`, given a test for whether a name is one.
-pub fn registrable_domain(host: &str, is_registrable: impl Fn(&str) -> bool) -> String {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    let dots: Vec<usize> = host.match_indices('.').map(|(i, _)| i).collect();
-    for &dot in dots.iter().rev() {
-        let suffix = &host[dot + 1..];
-        if suffix.contains('.') && is_registrable(suffix) {
-            return suffix.to_owned();
-        }
-    }
-    host
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn engine(rules: &str) -> Engine {
-        let mut engine = Engine::default();
-        engine.add_list(rules);
-        engine
-    }
-
-    fn request<'a>(url: &'a str, page_url: &'a str, resource_type: ResourceType) -> Request<'a> {
-        let host = |url: &'a str| {
-            let (start, end) = host_range(url.as_bytes()).unwrap();
-            &url[start..end]
-        };
-        let base = |host: &str| host.rsplitn(3, '.').take(2).collect::<Vec<_>>().join(".");
-        Request {
-            url,
-            page_host: Some(host(page_url)),
-            page_url: Some(page_url),
-            third_party: base(host(url)) != base(host(page_url)),
-            resource_type,
+    fn converted(list: &str) -> Vec<String> {
+        let (json, _) = convert_list(list);
+        let json = json.trim_start_matches('[').trim_end_matches(']');
+        if json.is_empty() {
+            return Vec::new();
         }
+        json.split(",\n").map(str::to_owned).collect()
     }
 
-    fn blocks(engine: &Engine, url: &str, page_url: &str, resource_type: ResourceType) -> bool {
-        engine.should_block(&request(url, page_url, resource_type))
-    }
-
-    const PAGE: &str = "https://news.example/story";
+    const DEFAULT_TYPES_JSON: &str = r#""resource-type":["script","style-sheet","image","font","media","other","fetch","ping","websocket"]"#;
 
     #[test]
-    fn host_anchor_matches_the_host_and_its_subdomains_only() {
-        let engine = engine("||ads.example.com^");
-        let script = ResourceType::Script;
-        assert!(blocks(
-            &engine,
-            "https://ads.example.com/x.js",
-            PAGE,
-            script
-        ));
-        assert!(blocks(
-            &engine,
-            "https://cdn.ads.example.com/x.js",
-            PAGE,
-            script
-        ));
-        assert!(blocks(
-            &engine,
-            "http://ads.example.com:8080/",
-            PAGE,
-            script
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://badads.example.com/x.js",
-            PAGE,
-            script
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://ads.example.com.evil/x.js",
-            PAGE,
-            script
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://example.com/ads.example.com/",
-            PAGE,
-            script
-        ));
-    }
-
-    #[test]
-    fn plain_patterns_match_anywhere_with_wildcards_and_separators() {
-        let engine = engine("/banner/*/ad_\n-advert-\n&adtype=^");
-        let image = ResourceType::Image;
-        assert!(blocks(
-            &engine,
-            "https://a.example/banner/123/ad_1.png",
-            PAGE,
-            image
-        ));
-        assert!(blocks(
-            &engine,
-            "https://a.example/x-advert-y.gif",
-            PAGE,
-            image
-        ));
-        assert!(blocks(
-            &engine,
-            "https://a.example/q?a=1&adtype=",
-            PAGE,
-            image
-        ));
-        assert!(blocks(
-            &engine,
-            "https://a.example/q?a=1&adtype=&b",
-            PAGE,
-            image
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://a.example/q?a=1&adtype=x",
-            PAGE,
-            image
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://a.example/banner.png",
-            PAGE,
-            image
-        ));
-    }
-
-    #[test]
-    fn start_and_end_anchors() {
-        let engine = engine("|https://track.\n.gif|");
-        let other = ResourceType::Other;
-        assert!(blocks(&engine, "https://track.example/p", PAGE, other));
-        assert!(!blocks(
-            &engine,
-            "https://x.example/https://track.",
-            PAGE,
-            other
-        ));
-        assert!(blocks(&engine, "https://x.example/pixel.gif", PAGE, other));
-        assert!(!blocks(
-            &engine,
-            "https://x.example/pixel.gif?x=1",
-            PAGE,
-            other
-        ));
-    }
-
-    #[test]
-    fn exceptions_override_unless_important() {
-        let engine = engine(
-            "||ads.example.com^\n@@||ads.example.com/allowed/\n||track.example^$important\n@@||track.example^",
+    fn host_anchors_match_the_host_and_its_subdomains() {
+        let rules = converted("||ads.example.com^$script");
+        assert_eq!(
+            rules,
+            [
+                r#"{"trigger":{"url-filter":"^[a-z][a-z0-9.+-]*://([^/:@?#]*\\.)?ads\\.example\\.com[^a-zA-Z0-9_.%-]","resource-type":["script"]},"action":{"type":"block"}}"#
+            ]
         );
-        let script = ResourceType::Script;
-        assert!(!blocks(
-            &engine,
-            "https://ads.example.com/allowed/a.js",
-            PAGE,
-            script
-        ));
-        assert!(blocks(
-            &engine,
-            "https://ads.example.com/other/a.js",
-            PAGE,
-            script
-        ));
-        assert!(blocks(&engine, "https://track.example/t.js", PAGE, script));
     }
 
     #[test]
-    fn third_party_and_resource_type_options() {
-        let engine = engine("||cdn.example^$third-party,script\n||img.example^$~image");
-        assert!(blocks(
-            &engine,
-            "https://cdn.example/a.js",
-            PAGE,
-            ResourceType::Script
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://cdn.example/a.css",
-            PAGE,
-            ResourceType::Stylesheet
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://cdn.example/a.js",
-            "https://www.cdn.example/",
-            ResourceType::Script
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://img.example/a.png",
-            PAGE,
-            ResourceType::Image
-        ));
-        assert!(blocks(
-            &engine,
-            "https://img.example/a.js",
-            PAGE,
-            ResourceType::Script
-        ));
+    fn a_final_separator_also_matches_the_end_of_the_url() {
+        let rules = converted("&adtype=^$image");
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].contains(r#""url-filter":"&adtype=[^a-zA-Z0-9_.%-]""#));
+        assert!(rules[1].contains(r#""url-filter":"&adtype=$""#));
     }
 
     #[test]
-    fn domain_option_limits_rules_to_pages() {
-        let engine = engine("/promo.$domain=shop.example|~sub.shop.example");
-        let image = ResourceType::Image;
-        assert!(blocks(
-            &engine,
-            "https://x.example/promo.png",
-            "https://shop.example/",
-            image
-        ));
-        assert!(blocks(
-            &engine,
-            "https://x.example/promo.png",
-            "https://a.shop.example/",
-            image
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://x.example/promo.png",
-            "https://sub.shop.example/",
-            image
-        ));
-        assert!(!blocks(&engine, "https://x.example/promo.png", PAGE, image));
+    fn wildcards_anchors_and_escaping() {
+        let rules = converted("/banner/*/ad_$image\n|https://track.$image\n.gif|$image\n*/a+b?(c)$image");
+        assert!(rules[0].contains(r#""url-filter":"/banner/.*/ad_""#));
+        assert!(rules[1].contains(r#""url-filter":"^https://track\\.""#));
+        assert!(rules[2].contains(r#""url-filter":"\\.gif$""#));
+        assert!(rules[3].contains(r#""url-filter":"/a\\+b\\?\\(c\\)""#));
     }
 
     #[test]
-    fn page_exceptions_turn_off_blocking_on_whole_pages() {
-        let engine = engine("||ads.example^\n@@||trusted.example^$document");
-        let script = ResourceType::Script;
-        assert!(!blocks(
-            &engine,
-            "https://ads.example/a.js",
-            "https://trusted.example/",
-            script
-        ));
-        assert!(blocks(&engine, "https://ads.example/a.js", PAGE, script));
+    fn untyped_rules_cover_everything_but_top_level_pages() {
+        let rules = converted("-advert-");
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].contains(DEFAULT_TYPES_JSON));
+        assert!(rules[1].contains(r#""resource-type":["document"],"load-context":["child-frame"]"#));
     }
 
     #[test]
-    fn pages_themselves_are_not_blocked_by_default() {
-        let engine = engine("||ads.example^");
-        assert!(!blocks(
-            &engine,
-            "https://ads.example/",
-            PAGE,
-            ResourceType::Document
-        ));
-        assert!(blocks(
-            &engine,
-            "https://ads.example/",
-            PAGE,
-            ResourceType::Subdocument
+    fn options_become_conditions() {
+        let rules = converted(
+            "||cdn.example^$third-party,script\n/promo.$image,domain=shop.example|a.example\n\
+             /x.$image,domain=~b.example,first-party\n/BannerAd.$image,match-case",
+        );
+        assert!(rules[0].contains(r#""load-type":["third-party"]"#));
+        assert!(rules[1].contains(r#""if-domain":["*shop.example","*a.example"]"#));
+        assert!(rules[2].contains(r#""load-type":["first-party"]"#));
+        assert!(rules[2].contains(r#""unless-domain":["*b.example"]"#));
+        assert!(rules[3].contains(r#""url-filter":"/BannerAd\\.""#));
+        assert!(rules[3].contains(r#""url-filter-is-case-sensitive":true"#));
+    }
+
+    #[test]
+    fn exceptions_follow_blocks_and_important_rules_follow_exceptions() {
+        let rules = converted(
+            "@@||trusted.example^$document\n||track.example^$important,script\n\
+             @@||ads.example/allowed/$script\n||ads.example^$script",
+        );
+        let actions: Vec<&str> = rules
+            .iter()
+            .map(|rule| {
+                if rule.contains("if-top-url") {
+                    "page exception"
+                } else if rule.contains("ignore-previous-rules") {
+                    "exception"
+                } else if rule.contains("track") {
+                    "important"
+                } else {
+                    "block"
+                }
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            ["block", "exception", "important", "page exception"]
+        );
+        assert!(rules[3].contains(
+            r#"{"url-filter":".*","if-top-url":["^[a-z][a-z0-9.+-]*://([^/:@?#]*\\.)?trusted\\.example[^a-zA-Z0-9_.%-]"]}"#
         ));
     }
 
     #[test]
-    fn match_case() {
-        let engine = engine("/BannerAd.$match-case");
-        let image = ResourceType::Image;
-        assert!(blocks(
-            &engine,
-            "https://x.example/BannerAd.png",
-            PAGE,
-            image
-        ));
-        assert!(!blocks(
-            &engine,
-            "https://x.example/bannerad.png",
-            PAGE,
-            image
-        ));
-    }
-
-    #[test]
-    fn skips_what_it_cannot_apply() {
-        let mut engine = Engine::default();
-        let stats = engine.add_list(
+    fn skips_what_it_cannot_express() {
+        let (_, stats) = convert_list(
             "[Adblock Plus 2.0]\n! comment\n\nexample.com##.ad\n##.banner\nexample.com#@#.ad\n\
              /ads[0-9]+/\n||x.example^$redirect=noop.js\n||y.example^$csp=script-src 'none'\n\
-             ||z.example^$domain=example.*\n||popup.example^$popup\n||w.example^",
+             ||z.example^$domain=example.*\n||popup.example^$popup\n||w.example^\n\
+             ||v.example^$domain=a.example|~b.a.example\n||caf\u{e9}.example^",
         );
         assert_eq!(
             stats,
             ListStats {
                 rules: 1,
-                unsupported: 5
+                unsupported: 7
             }
         );
-        let script = ResourceType::Script;
-        assert!(blocks(&engine, "https://w.example/a.js", PAGE, script));
-        assert!(!blocks(&engine, "https://x.example/a.js", PAGE, script));
-        assert!(!blocks(&engine, "https://popup.example/", PAGE, script));
     }
 
     #[test]
-    fn rules_are_found_whatever_token_they_are_indexed_by() {
-        let engine = engine("||ab.com^\n*/ad/*\nad\n||a.b.c^");
-        let other = ResourceType::Other;
-        assert!(blocks(&engine, "https://ab.com/", PAGE, other));
-        assert!(blocks(&engine, "https://x.example/p/ad/q", PAGE, other));
-        assert!(blocks(&engine, "https://x.example/readme", PAGE, other));
-        assert!(blocks(&engine, "https://a.b.c/", PAGE, other));
-    }
-
-    #[test]
-    fn registrable_domains() {
-        let is_registrable = |name: &str| matches!(name, "example.com" | "example.co.uk");
-        assert_eq!(
-            registrable_domain("www.example.com", is_registrable),
-            "example.com"
-        );
-        assert_eq!(
-            registrable_domain("a.b.example.co.uk", is_registrable),
-            "example.co.uk"
-        );
-        assert_eq!(
-            registrable_domain("example.com", is_registrable),
-            "example.com"
-        );
-        assert_eq!(registrable_domain("localhost", is_registrable), "localhost");
+    fn output_is_a_json_array() {
+        let (json, _) = convert_list("||a.example^\n@@||a.example/ok^");
+        assert!(json.starts_with("[{") && json.ends_with("}]"));
+        assert_eq!(convert_list("! nothing").0, "[]");
     }
 }

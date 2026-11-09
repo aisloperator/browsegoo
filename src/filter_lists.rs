@@ -1,5 +1,5 @@
 //! The filter lists BrowseGoo knows about, which of them are enabled, and their
-//! copies in the cache directory.
+//! copies in the cache directory, which are kept in the lists' own format.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use std::{fs, io};
 use url::Url;
 
 use crate::fetch;
-use crate::filter::{Engine, ListStats};
+use crate::filter::{self, ListStats};
 
 pub struct FilterList {
     /// Also the name of its file in the cache.
@@ -100,36 +100,94 @@ pub struct ListStatus {
     pub downloaded: Option<SystemTime>,
     /// For enabled lists that are downloaded.
     pub stats: Option<ListStats>,
+    /// Why WebKit couldn't use the list, if it couldn't.
+    pub problem: Option<String>,
 }
 
 pub fn cache_path(cache_dir: &Path, list: &FilterList) -> PathBuf {
     cache_dir.join(format!("{}.txt", list.id))
 }
 
-/// Builds a filter engine from the cached copies of the enabled lists, and
-/// reports on every list.
-pub fn build_engine(
+/// A downloaded list, converted for WebKit.
+pub struct Converted {
+    pub list: &'static FilterList,
+    /// Changes with the list and with how it's converted, so that it's only
+    /// compiled again when needed.
+    pub fingerprint: String,
+    pub json: String,
+}
+
+/// Where WebKit keeps the compiled lists, each named by its list's ID.
+pub fn compiled_dir(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("compiled")
+}
+
+fn fingerprint_path(cache_dir: &Path, list: &FilterList) -> PathBuf {
+    compiled_dir(cache_dir).join(format!("{}.fingerprint", list.id))
+}
+
+/// Whether the compiled list in WebKit's store is of this conversion.
+pub fn is_compiled(cache_dir: &Path, converted: &Converted) -> bool {
+    fs::read_to_string(fingerprint_path(cache_dir, converted.list))
+        .is_ok_and(|fingerprint| fingerprint == converted.fingerprint)
+}
+
+/// Records that this conversion is the one compiled in WebKit's store.
+pub fn mark_compiled(cache_dir: &Path, converted: &Converted) -> io::Result<()> {
+    fs::create_dir_all(compiled_dir(cache_dir))?;
+    write_atomically(
+        &fingerprint_path(cache_dir, converted.list),
+        converted.fingerprint.as_bytes(),
+    )
+}
+
+/// Bump this when `filter` converts lists differently, so that they're compiled again.
+const CONVERSION_VERSION: u32 = 1;
+
+/// Converts the cached copies of the enabled lists, and reports on every list.
+pub fn convert_lists(
     cache_dir: &Path,
     enabled: &[&FilterList],
-) -> (Engine, BTreeMap<&'static str, ListStatus>) {
-    let mut engine = Engine::default();
+) -> (Vec<Converted>, BTreeMap<&'static str, ListStatus>) {
+    let mut converted = Vec::new();
     let mut statuses = BTreeMap::new();
     for list in &LISTS {
         let path = cache_path(cache_dir, list);
         let mut status = ListStatus {
             downloaded: fs::metadata(&path).and_then(|data| data.modified()).ok(),
             stats: None,
+            problem: None,
         };
         if enabled.iter().any(|enabled| enabled.id == list.id) {
             match fs::read_to_string(&path) {
-                Ok(text) => status.stats = Some(engine.add_list(&text)),
+                Ok(text) => {
+                    let (json, stats) = filter::convert_list(&text);
+                    status.stats = Some(stats);
+                    converted.push(Converted {
+                        list,
+                        fingerprint: format!("{:016x}", fingerprint(&text)),
+                        json,
+                    });
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => eprintln!("Could not read filter list {}: {error}", list.name),
             }
         }
         statuses.insert(list.id, status);
     }
-    (engine, statuses)
+    (converted, statuses)
+}
+
+/// A hash of a list and of how it's converted.
+fn fingerprint(text: &str) -> u64 {
+    // FNV-1a, which unlike Rust's own hashing stays the same between versions.
+    let bytes = CONVERSION_VERSION.to_le_bytes();
+    bytes
+        .iter()
+        .chain(text.as_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, &c| {
+            (hash ^ u64::from(c)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 /// Downloads a list into the cache.
@@ -190,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_uses_only_enabled_downloaded_lists() {
+    fn only_enabled_downloaded_lists_are_converted() {
         let cache = temporary_dir("cache");
         fs::write(
             cache_path(&cache, &LISTS[0]),
@@ -203,12 +261,23 @@ mod tests {
         )
         .unwrap();
 
-        let (engine, statuses) = build_engine(&cache, &[&LISTS[0], &LISTS[1]]);
-        assert_eq!(engine.rule_count(), 2);
+        let (converted, statuses) = convert_lists(&cache, &[&LISTS[0], &LISTS[1]]);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].list.id, "easylist");
+        assert!(!is_compiled(&cache, &converted[0]));
+        mark_compiled(&cache, &converted[0]).unwrap();
+        assert!(is_compiled(&cache, &converted[0]));
+        assert!(converted[0].json.contains("a\\\\.example"));
         assert_eq!(statuses["easylist"].stats.map(|stats| stats.rules), Some(2));
         assert!(statuses["easyprivacy"].downloaded.is_none());
         assert!(statuses["peter-lowe"].downloaded.is_some());
         assert!(statuses["peter-lowe"].stats.is_none());
+    }
+
+    #[test]
+    fn identifiers_change_with_the_list() {
+        assert_eq!(fingerprint("||a^"), fingerprint("||a^"));
+        assert_ne!(fingerprint("||a^"), fingerprint("||b^"));
     }
 
     #[test]

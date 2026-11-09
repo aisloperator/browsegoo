@@ -1,4 +1,4 @@
-//! BrowseGoo: a barebones Web browser built around the Servo engine, using GTK4.
+//! BrowseGoo: a barebones Web browser built around the WebKit engine, using GTK4.
 
 mod bookmarks;
 mod bookmarks_editor;
@@ -8,13 +8,10 @@ mod completion;
 mod fetch;
 mod filter;
 mod filter_lists;
-mod input;
 mod location;
 mod location_bar;
 mod preferences;
-mod web_area;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::{env, fs};
 
@@ -54,15 +51,16 @@ fn main() -> ExitCode {
         },
     };
 
-    // Servo does TLS itself, using rustls. It only needs us to pick the crypto provider.
+    // WebKit does TLS for pages itself, and rustls is only for downloading filter
+    // lists, but it needs its crypto provider picked first.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("nothing else should have installed a TLS crypto provider yet");
 
-    let config_dir = match create_config_dir() {
-        Ok(config_dir) => config_dir,
+    let dirs = match create_dirs() {
+        Ok(dirs) => dirs,
         Err(error) => {
-            eprintln!("Could not create the BrowseGoo configuration directory: {error}");
+            eprintln!("Could not create BrowseGoo's directories: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -80,7 +78,7 @@ fn main() -> ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_activate(move |app| browser::open(app, config_dir.clone(), start_url.clone()));
+    app.connect_activate(move |app| browser::open(app, dirs.clone(), start_url.clone()));
 
     // Our arguments were handled above, so that GTK doesn't try to open them as files.
     match app.run_with_args::<&str>(&[]) {
@@ -89,13 +87,19 @@ fn main() -> ExitCode {
     }
 }
 
-/// Creates the directory for bookmarks, and for Servo's cookies. Those and the
-/// HTTP authentication that Servo also saves there are private to the user.
-fn create_config_dir() -> std::io::Result<PathBuf> {
+/// Creates BrowseGoo's directories. They're private to the user, as they have
+/// cookies, saved passwords for sites, and browsing history in caches.
+fn create_dirs() -> std::io::Result<browser::Dirs> {
     use std::os::unix::fs::PermissionsExt;
 
-    let config_dir = glib::user_config_dir().join("browsegoo");
-    fs::create_dir_all(&config_dir)?;
-    fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o700))?;
-    Ok(config_dir)
+    let dirs = browser::Dirs {
+        config: glib::user_config_dir().join("browsegoo"),
+        data: glib::user_data_dir().join("browsegoo"),
+        cache: glib::user_cache_dir().join("browsegoo"),
+    };
+    for dir in [&dirs.config, &dirs.data, &dirs.cache] {
+        fs::create_dir_all(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dirs)
 }

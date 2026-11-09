@@ -1,67 +1,49 @@
-//! The browser window, its tabs, and their connection to Servo.
-//!
-//! GTK has no way to embed a native window for Servo to draw into, so Servo
-//! renders to an offscreen software OpenGL surface, and each finished frame is
-//! copied into a GTK texture.
-//!
-//! Every tab has its own Servo `WebView`, but they all share that one surface.
-//! Only the active tab's `WebView` is shown there, and each tab has its own
-//! widget that keeps the last frame painted for it.
+//! The browser window, its tabs, and their WebKit views.
 //!
 //! The tabs are in the title bar, above the toolbar. A `gtk::Notebook` puts
 //! each page right under the tabs, with no room for a shared toolbar, so the
 //! notebook only provides the tabs, with an empty placeholder as each one's
 //! page, and the pages themselves are in a `gtk::Stack` below the toolbar.
+//!
+//! WebKit runs each page's content in separate, sandboxed processes, and does
+//! its networking in another. This process only has the user interface.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
 
-use content_security_policy::Destination;
-use dpi::PhysicalSize;
-use euclid::Scale;
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
-use servo::{
-    ClipboardDelegate, CreateNewWebViewRequest, Cursor, DeviceIntRect, DevicePoint, EventLoopWaker,
-    InputEvent, KeyState, LoadStatus, MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent,
-    MouseMoveEvent, Opts, Preferences, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, StringRequest, WebResourceLoad, WebResourceResponse, WebView,
-    WebViewBuilder, WebViewDelegate, WebViewId, WheelDelta, WheelEvent, WheelMode,
-};
 use url::Url;
+use webkit::prelude::*;
 
+use crate::VERSION;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::closing;
-use crate::filter::{self, Engine, ResourceType};
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
 use crate::preferences::PreferencesWindow;
-use crate::web_area::WebArea;
-use crate::{VERSION, input};
 
 const INITIAL_WIDTH: i32 = 1024;
 const INITIAL_HEIGHT: i32 = 768;
 
-/// How far one notch of a mouse wheel scrolls, in the units Servo's own example uses.
-const WHEEL_NOTCH_PIXELS: f64 = 76.0;
-
 const NEW_TAB_TITLE: &str = "New Tab";
-
-/// How soon after a middle-click a request for a new tab is taken to be from it.
-const MIDDLE_CLICK_WINDOW: Duration = Duration::from_secs(2);
 
 const CREDIT: &str = "Created by AI Sloperator with Claude Code";
 const WEBSITE: &str = "https://www.aisloperator.com/";
 const LICENSE_STATEMENT: &str = "No license is given.";
 
+/// What a page shows after its web process crashes.
+const CRASHED_PAGE: &str = "<!doctype html><title>Crashed</title>\
+    <body style=\"font: 16px sans-serif; margin: 3em\">\
+    <h1 style=\"font-size: 1.5em\">This page crashed</h1>\
+    <p>Press Reload to load it again.</p>";
+
 thread_local! {
-    /// The running browser, for Servo's waker to reach from other threads.
+    /// The running browser, for signal handlers to reach.
     static BROWSER: RefCell<Option<Rc<Browser>>> = const { RefCell::new(None) };
 }
 
@@ -69,28 +51,19 @@ fn current_browser() -> Option<Rc<Browser>> {
     BROWSER.with_borrow(Clone::clone)
 }
 
-/// Lets Servo ask for `Servo::spin_event_loop` to be called on the main thread.
+fn user_agent() -> String {
+    format!("BrowseGoo/{VERSION}")
+}
+
+/// Where BrowseGoo keeps things, which are created before the browser opens.
 #[derive(Clone)]
-struct Waker;
-
-/// Whether a spin is already queued, so that wakes don't pile up in the main loop.
-static SPIN_QUEUED: AtomicBool = AtomicBool::new(false);
-
-impl EventLoopWaker for Waker {
-    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
-        Box::new(self.clone())
-    }
-
-    fn wake(&self) {
-        if !SPIN_QUEUED.swap(true, Ordering::AcqRel) {
-            glib::MainContext::default().invoke(|| {
-                SPIN_QUEUED.store(false, Ordering::Release);
-                if let Some(browser) = current_browser() {
-                    browser.spin();
-                }
-            });
-        }
-    }
+pub struct Dirs {
+    /// Bookmarks and settings.
+    pub config: PathBuf,
+    /// Cookies, and what sites store, such as with `localStorage`.
+    pub data: PathBuf,
+    /// Filter lists, and WebKit's cache.
+    pub cache: PathBuf,
 }
 
 struct Widgets {
@@ -105,42 +78,43 @@ struct Widgets {
     bookmarks_popover: gtk::Popover,
 }
 
-/// One browser tab. The state that the toolbar shows is kept for every tab, so
-/// that it can be shown again when the tab becomes active.
+/// Identifies a tab, as WebKit views have no IDs of their own.
+type TabId = u64;
+
+/// One browser tab.
 struct Tab {
-    webview: WebView,
-    area: WebArea,
-    /// This tab's page in the tab strip, which only stands in for `area`.
+    id: TabId,
+    webview: webkit::WebView,
+    /// The filters this tab uses, which are its own so that they can be off.
+    content: webkit::UserContentManager,
+    /// This tab's page in the tab strip, which only stands in for the view.
     placeholder: gtk::Box,
     label: gtk::Label,
-    title: RefCell<Option<String>>,
-    can_go_back: Cell<bool>,
-    can_go_forward: Cell<bool>,
-    progress: Cell<f64>,
     /// Whether this was opened as a blank tab, for typing a location into.
     opened_blank: bool,
     filtering: Cell<bool>,
     /// The tab whose page opened this one, if any.
-    opener: Option<WebViewId>,
-    /// Requests blocked since the current page started loading.
-    blocked: Cell<u32>,
+    opener: Option<TabId>,
+    /// The address of the page that crashed, if the page shown is the crash page.
+    crashed: RefCell<Option<String>>,
+    /// Whether the crash page is about to load, which isn't leaving it.
+    loading_crash_page: Cell<bool>,
 }
 
 impl Tab {
-    fn id(&self) -> WebViewId {
-        self.webview.id()
-    }
-
     /// The URL to show in the location field, which is empty for a new tab.
     fn location_text(&self) -> String {
-        match self.webview.url() {
-            Some(url) if url.as_str() != "about:blank" => url.to_string(),
+        if let Some(url) = self.crashed.borrow().as_ref() {
+            return url.clone();
+        }
+        match self.webview.uri() {
+            Some(url) if url != "about:blank" => url.to_string(),
             _ => String::new(),
         }
     }
 
     fn display_title(&self) -> String {
-        match self.title.borrow().as_deref() {
+        match self.webview.title() {
             Some(title) if !title.trim().is_empty() => title.trim().to_owned(),
             _ => match self.location_text() {
                 url if url.is_empty() => NEW_TAB_TITLE.to_owned(),
@@ -153,111 +127,112 @@ impl Tab {
         self.label.set_text(&self.display_title());
         self.label.set_tooltip_text(Some(&self.display_title()));
     }
+
+    /// The page shown, as a bookmark of it would be.
+    fn page(&self) -> Option<Bookmark> {
+        let url = self.location_text();
+        if url.is_empty() {
+            return None;
+        }
+        let title = match self.webview.title() {
+            Some(title) if !title.trim().is_empty() => title.to_string(),
+            _ => url.clone(),
+        };
+        Some(Bookmark { url, title })
+    }
+
+    /// Reloads the page, or loads it again after it crashed.
+    fn reload(&self) {
+        match self.crashed.take() {
+            Some(url) => self.webview.load_uri(&url),
+            None => self.webview.reload(),
+        }
+    }
+
+    /// How far the page has loaded, for the location field, which shows
+    /// nothing once it's done.
+    fn progress(&self) -> f64 {
+        if self.webview.is_loading() {
+            self.webview.estimated_load_progress().max(0.1)
+        } else {
+            0.0
+        }
+    }
 }
 
 struct Browser {
-    // This is an option so that `shut_down` can release it after the tabs.
-    servo: RefCell<Option<Servo>>,
     /// In no particular order. The tab strip has the order the user sees.
     tabs: RefCell<Vec<Rc<Tab>>>,
-    rendering_context: Rc<SoftwareRenderingContext>,
+    next_tab_id: Cell<TabId>,
     widgets: Widgets,
+    dirs: Dirs,
+    network_session: webkit::NetworkSession,
+    settings: webkit::Settings,
     bookmarks: RefCell<Bookmarks>,
-    needs_paint: Cell<bool>,
-    pending_size: Cell<Option<PhysicalSize<u32>>>,
-    pointer: Cell<DevicePoint>,
-    /// Servo's event loop must not be spun again from inside itself.
-    spinning: Cell<bool>,
-    filter: RefCell<Rc<Engine>>,
+    /// Where WebKit keeps the compiled filter lists.
+    filter_store: webkit::UserContentFilterStore,
+    /// The compiled filter lists in use.
+    filters: RefCell<Vec<webkit::UserContentFilter>>,
     filter_settings: RefCell<filter_lists::Settings>,
     list_statuses: RefCell<BTreeMap<&'static str, ListStatus>>,
-    /// Where filter lists are cached.
-    cache_dir: PathBuf,
-    /// Counts filter rebuilds, so that only the newest one is used.
+    /// Counts filter reloads, so that only the newest one is used.
     filter_generation: Cell<u64>,
     updating_lists: Cell<bool>,
+    /// The page to load once the filters are first ready, so that it's filtered.
+    start_page: RefCell<Option<(TabId, Url)>>,
     preferences: RefCell<Option<PreferencesWindow>>,
-    /// The last middle-click on a page, if it might still open a tab.
-    middle_click: Cell<Option<MiddleClick>>,
     bookmarks_editor: RefCell<Option<Rc<BookmarksEditor>>>,
 }
 
-#[derive(Clone, Copy)]
-struct MiddleClick {
-    tab: WebViewId,
-    at: Instant,
-    shift: bool,
-}
-
 /// Opens the browser window at `start_url`.
-pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
+pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
     if current_browser().is_some() {
         return;
     }
 
-    let size = PhysicalSize::new(INITIAL_WIDTH as u32, INITIAL_HEIGHT as u32);
-    let rendering_context = match SoftwareRenderingContext::new(size) {
-        Ok(context) => Rc::new(context),
-        Err(error) => {
-            eprintln!("Could not create a software OpenGL context: {error:?}");
-            app.quit();
-            return;
+    let network_session = webkit::NetworkSession::new(
+        dirs.data.to_str(),
+        dirs.cache.join("web").to_str(),
+    );
+    if let Some(cookies) = network_session.cookie_manager() {
+        if let Some(path) = dirs.data.join("cookies.sqlite").to_str() {
+            cookies.set_persistent_storage(path, webkit::CookiePersistentStorage::Sqlite);
         }
-    };
-    if let Err(error) = rendering_context.make_current() {
-        eprintln!("Could not use the software OpenGL context: {error:?}");
-        app.quit();
-        return;
     }
+    let settings = webkit::Settings::new();
+    settings.set_user_agent(Some(&user_agent()));
 
-    let opts = Opts {
-        config_dir: Some(config_dir.clone()),
-        ..Default::default()
-    };
-    let preferences = Preferences {
-        user_agent: format!("BrowseGoo/{VERSION}"),
-        // Servo has this but disables it by default, and sites that use it to reveal
-        // their content as it scrolls into view would otherwise stay partly blank.
-        dom_intersection_observer_enabled: true,
-        ..Default::default()
-    };
-    let servo = ServoBuilder::default()
-        .opts(opts)
-        .preferences(preferences)
-        .event_loop_waker(Box::new(Waker))
-        .build();
-    servo.setup_logging();
-
-    let bookmarks = Bookmarks::load(config_dir.join("bookmarks.tsv")).unwrap_or_else(|error| {
+    let bookmarks = Bookmarks::load(dirs.config.join("bookmarks.tsv")).unwrap_or_else(|error| {
         // Carrying on would overwrite the bookmarks that we couldn't read.
         eprintln!("Could not read bookmarks: {error}");
         std::process::exit(1);
     });
-    let filter_settings = filter_lists::Settings::load(config_dir.join("filter_lists.tsv"))
+    let filter_settings = filter_lists::Settings::load(dirs.config.join("filter_lists.tsv"))
         .unwrap_or_else(|error| {
             // Carrying on would overwrite the settings that we couldn't read.
             eprintln!("Could not read filter list settings: {error}");
             std::process::exit(1);
         });
+    let filter_store = webkit::UserContentFilterStore::new(
+        &filter_lists::compiled_dir(&dirs.cache).to_string_lossy(),
+    );
 
     let browser = Rc::new(Browser {
-        servo: RefCell::new(Some(servo)),
         tabs: RefCell::new(Vec::new()),
-        rendering_context,
+        next_tab_id: Cell::new(1),
         widgets: build_widgets(app),
+        dirs,
+        network_session,
+        settings,
         bookmarks: RefCell::new(bookmarks),
-        needs_paint: Cell::new(false),
-        pending_size: Cell::new(None),
-        pointer: Cell::new(DevicePoint::zero()),
-        spinning: Cell::new(false),
-        filter: RefCell::new(Rc::new(Engine::default())),
+        filter_store,
+        filters: RefCell::new(Vec::new()),
         filter_settings: RefCell::new(filter_settings),
         list_statuses: RefCell::new(BTreeMap::new()),
-        cache_dir: glib::user_cache_dir().join("browsegoo"),
         filter_generation: Cell::new(0),
         updating_lists: Cell::new(false),
+        start_page: RefCell::new(None),
         preferences: RefCell::new(None),
-        middle_click: Cell::new(None),
         bookmarks_editor: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
@@ -265,13 +240,17 @@ pub fn open(app: &gtk::Application, config_dir: PathBuf, start_url: Url) {
     browser.connect_widgets();
     browser.connect_actions(app);
     browser.rebuild_bookmark_list();
+    if start_url.as_str() == "about:blank" {
+        browser.open_tab(None);
+    } else {
+        let tab = browser.add_tab(None, false, None, true);
+        browser.widgets.location.set_text(start_url.as_str());
+        browser.start_page.replace(Some((tab.id, start_url)));
+    }
     browser.reload_filters();
-    browser.open_tab(start_url);
 
-    gdk::GLContext::clear_current();
     browser.widgets.window.present();
     browser.focus_page_or_location();
-    browser.spin();
 }
 
 fn build_widgets(app: &gtk::Application) -> Widgets {
@@ -411,10 +390,6 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
 }
 
 impl Browser {
-    fn servo(&self) -> std::cell::Ref<'_, Option<Servo>> {
-        self.servo.borrow()
-    }
-
     fn active_tab(&self) -> Option<Rc<Tab>> {
         let notebook = &self.widgets.tabs;
         let page = notebook.nth_page(notebook.current_page())?;
@@ -425,57 +400,52 @@ impl Browser {
             .cloned()
     }
 
-    fn tab(&self, id: WebViewId) -> Option<Rc<Tab>> {
-        self.tabs
-            .borrow()
-            .iter()
-            .find(|tab| tab.id() == id)
-            .cloned()
+    fn tab(&self, id: TabId) -> Option<Rc<Tab>> {
+        self.tabs.borrow().iter().find(|tab| tab.id == id).cloned()
     }
 
-    fn is_active(&self, id: WebViewId) -> bool {
-        self.active_tab().is_some_and(|tab| tab.id() == id)
+    fn is_active(&self, id: TabId) -> bool {
+        self.active_tab().is_some_and(|tab| tab.id == id)
     }
 
-    /// The active tab's `WebView`.
-    fn webview(&self) -> Option<WebView> {
+    /// The active tab's view.
+    fn webview(&self) -> Option<webkit::WebView> {
         self.active_tab().map(|tab| tab.webview.clone())
     }
 
-    fn webview_builder(self: &Rc<Self>, builder: WebViewBuilder) -> WebViewBuilder {
-        builder
-            .hidpi_scale_factor(Scale::new(self.widgets.window.scale_factor() as f32))
-            .delegate(self.clone())
-            .clipboard_delegate(self.clone())
+    /// Opens a new tab, at `url` or blank, and makes it the active tab.
+    fn open_tab(self: &Rc<Self>, url: Option<Url>) -> Rc<Tab> {
+        let tab = self.add_tab(None, url.is_none(), None, true);
+        if let Some(url) = url {
+            tab.webview.load_uri(url.as_str());
+        }
+        tab
     }
 
-    /// Opens `url` in a new tab, and makes it the active tab.
-    fn open_tab(self: &Rc<Self>, url: Url) {
-        let Some(servo) = self.servo().clone() else {
-            return;
-        };
-        let builder = WebViewBuilder::new(&servo, self.rendering_context.clone());
-        let opened_blank = url.as_str() == "about:blank";
-        self.add_tab(
-            self.webview_builder(builder.url(url)).build(),
-            opened_blank,
-            None,
-            true,
-        );
-    }
-
-    /// Adds a tab for `webview`, which a page in the `opener` tab may have
-    /// opened, and makes it the active tab if `activate`.
+    /// Adds a tab, whose page the `opener` tab may have opened, and makes it the
+    /// active tab if `activate`. A page that opens another, such as with
+    /// `window.open()`, needs the new one to be `related` to its own view.
     fn add_tab(
         self: &Rc<Self>,
-        webview: WebView,
+        related: Option<&webkit::WebView>,
         opened_blank: bool,
-        opener: Option<WebViewId>,
+        opener: Option<TabId>,
         activate: bool,
-    ) {
-        let id = webview.id();
-        let area = WebArea::new();
-        self.connect_input(&area, id);
+    ) -> Rc<Tab> {
+        let id = self.next_tab_id.get();
+        self.next_tab_id.set(id + 1);
+
+        let content = webkit::UserContentManager::new();
+        let builder = webkit::WebView::builder()
+            .settings(&self.settings)
+            .user_content_manager(&content)
+            .hexpand(true)
+            .vexpand(true);
+        // A related view shares the other's network session.
+        let webview = match related {
+            Some(related) => builder.related_view(related).build(),
+            None => builder.network_session(&self.network_session).build(),
+        };
 
         let label = gtk::Label::builder()
             .label(NEW_TAB_TITLE)
@@ -502,29 +472,24 @@ impl Browser {
         tab_label.add_controller(middle_click);
 
         let tab = Rc::new(Tab {
+            id,
             webview,
-            area,
+            content,
             placeholder: gtk::Box::new(gtk::Orientation::Vertical, 0),
             label,
-            title: RefCell::new(None),
-            can_go_back: Cell::new(false),
-            can_go_forward: Cell::new(false),
-            progress: Cell::new(0.0),
             opened_blank,
             filtering: Cell::new(true),
             opener,
-            blocked: Cell::new(0),
+            crashed: RefCell::new(None),
+            loading_crash_page: Cell::new(false),
         });
         tab.update_label();
-
-        if !activate {
-            // Otherwise it would be painted over the active tab's page.
-            tab.webview.hide();
-        }
+        self.apply_filters(&tab);
+        self.connect_webview(&tab);
 
         // The tab must be known before the tab strip announces it as active.
         self.tabs.borrow_mut().push(tab.clone());
-        self.widgets.pages.add_child(&tab.area);
+        self.widgets.pages.add_child(&tab.webview);
         let position = opener.and_then(|opener| self.position_for_tab_from(opener));
         let notebook = &self.widgets.tabs;
         let index = notebook.insert_page(&tab.placeholder, Some(&tab_label), position);
@@ -532,11 +497,145 @@ impl Browser {
         if activate {
             notebook.set_current_page(Some(index));
         }
+        tab
+    }
+
+    /// Keeps the tab and toolbar up to date with a tab's page, and handles what
+    /// the page asks of the browser.
+    fn connect_webview(&self, tab: &Tab) {
+        let id = tab.id;
+        let webview = &tab.webview;
+
+        webview.connect_title_notify(move |_| {
+            if let Some(browser) = current_browser() {
+                browser.page_changed(id);
+            }
+        });
+        webview.connect_uri_notify(move |_| {
+            if let Some(browser) = current_browser() {
+                browser.page_changed(id);
+            }
+        });
+        let show_progress = move || {
+            if let Some(browser) = current_browser() {
+                if let (true, Some(tab)) = (browser.is_active(id), browser.tab(id)) {
+                    browser
+                        .widgets
+                        .location
+                        .set_progress_fraction(tab.progress());
+                }
+            }
+        };
+        webview.connect_estimated_load_progress_notify(move |_| show_progress());
+        webview.connect_is_loading_notify(move |_| show_progress());
+
+        webview.connect_load_changed(move |_, event| {
+            let Some(browser) = current_browser() else {
+                return;
+            };
+            if let (webkit::LoadEvent::Started, Some(tab)) = (event, browser.tab(id)) {
+                if !tab.loading_crash_page.take() {
+                    tab.crashed.replace(None);
+                }
+            }
+        });
+        if let Some(history) = webview.back_forward_list() {
+            // The bindings leave this signal out, as it has untyped arguments.
+            history.connect_local("changed", false, move |_| {
+                if let Some(browser) = current_browser() {
+                    browser.page_changed(id);
+                }
+                None
+            });
+        }
+
+        // A link clicked with the middle button, or with Ctrl, opens in a new
+        // tab in the background, or in the foreground if Shift is also held.
+        webview.connect_decide_policy(move |_, decision, kind| {
+            if !matches!(
+                kind,
+                webkit::PolicyDecisionType::NavigationAction
+                    | webkit::PolicyDecisionType::NewWindowAction
+            ) {
+                return false;
+            }
+            let Some(decision) = decision.downcast_ref::<webkit::NavigationPolicyDecision>() else {
+                return false;
+            };
+            let Some(action) = decision.navigation_action() else {
+                return false;
+            };
+            let modifiers = gdk::ModifierType::from_bits_truncate(action.modifiers());
+            let new_tab = action.navigation_type() == webkit::NavigationType::LinkClicked
+                && (action.mouse_button() == gdk::BUTTON_MIDDLE
+                    || modifiers.contains(gdk::ModifierType::CONTROL_MASK));
+            let url = action
+                .request()
+                .and_then(|request| request.uri())
+                .and_then(|url| Url::parse(&url).ok());
+            let (true, Some(url), Some(browser)) = (new_tab, url, current_browser()) else {
+                return false;
+            };
+            decision.ignore();
+            let activate = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
+            let tab = browser.add_tab(None, false, Some(id), activate);
+            tab.webview.load_uri(url.as_str());
+            true
+        });
+
+        // A page that opens a new window, such as with a `target="_blank"` link
+        // or `window.open()`, gets a new tab instead.
+        webview.connect_create(move |webview, _| {
+            let browser = current_browser()?;
+            let tab = browser.add_tab(Some(webview), false, Some(id), true);
+            Some(tab.webview.clone().upcast())
+        });
+
+        // A page closed itself, such as with `window.close()`.
+        webview.connect_close(move |_| {
+            // Not while WebKit is still telling us.
+            glib::idle_add_local_once(move || close_tab_by_id(id));
+        });
+
+        webview.connect_web_process_terminated(move |webview, reason| {
+            if reason == webkit::WebProcessTerminationReason::TerminatedByApi {
+                return;
+            }
+            let Some(tab) = current_browser().and_then(|browser| browser.tab(id)) else {
+                return;
+            };
+            let url = tab.location_text();
+            if reason == webkit::WebProcessTerminationReason::ExceededMemoryLimit {
+                eprintln!("A page used too much memory, and was stopped: {url}");
+            } else {
+                eprintln!("A page crashed: {url}");
+            }
+            tab.crashed.replace(Some(url));
+            tab.loading_crash_page.set(true);
+            webview.load_alternate_html(CRASHED_PAGE, "about:blank", None);
+        });
+    }
+
+    /// Shows a change in a tab's page, such as a new address or title.
+    fn page_changed(&self, id: TabId) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        tab.update_label();
+        if !self.is_active(id) {
+            return;
+        }
+        self.set_window_title(tab.webview.title().as_deref());
+        if !self.is_editing_location() {
+            self.widgets.location_bar.set_text(&tab.location_text());
+        }
+        self.set_history_available(tab.webview.can_go_back(), tab.webview.can_go_forward());
+        self.update_bookmark_button();
     }
 
     /// Where a tab opened from the `opener` tab goes: after it, and after the
     /// tabs it already opened, so that they stay in the order they were opened.
-    fn position_for_tab_from(&self, opener: WebViewId) -> Option<u32> {
+    fn position_for_tab_from(&self, opener: TabId) -> Option<u32> {
         let notebook = &self.widgets.tabs;
         let mut position = notebook.page_num(&self.tab(opener)?.placeholder)? + 1;
         while let Some(page) = notebook.nth_page(Some(position)) {
@@ -551,7 +650,7 @@ impl Browser {
         Some(position)
     }
 
-    fn close_tab(&self, id: WebViewId) {
+    fn close_tab(&self, id: TabId) {
         let Some(tab) = self.tab(id) else {
             return;
         };
@@ -559,13 +658,11 @@ impl Browser {
             self.widgets.window.close();
             return;
         }
-        self.tabs.borrow_mut().retain(|other| other.id() != id);
+        self.tabs.borrow_mut().retain(|other| other.id != id);
         // This makes another tab active, if this one was.
         self.widgets.tabs.detach_tab(&tab.placeholder);
-        self.widgets.pages.remove(&tab.area);
-        // Dropping the last handle to the `WebView` closes it in Servo.
-        drop(tab);
-        Waker.wake();
+        // Which also ends the page, once nothing else refers to its view.
+        self.widgets.pages.remove(&tab.webview);
     }
 
     /// Shows the newly active tab's page and state.
@@ -573,28 +670,16 @@ impl Browser {
         let Some(active) = self.active_tab() else {
             return;
         };
-        for tab in self.tabs.borrow().iter() {
-            if tab.id() != active.id() {
-                tab.webview.hide();
-            }
-        }
-        active.webview.show();
-        self.widgets.pages.set_visible_child(&active.area);
-
-        let title = active.title.borrow().clone();
-        self.set_window_title(title.as_deref());
+        self.widgets.pages.set_visible_child(&active.webview);
+        self.set_window_title(active.webview.title().as_deref());
         self.widgets.location_bar.set_text(&active.location_text());
         self.widgets
             .location
-            .set_progress_fraction(active.progress.get());
-        self.set_history_available(active.can_go_back.get(), active.can_go_forward.get());
+            .set_progress_fraction(active.progress());
+        self.set_history_available(active.webview.can_go_back(), active.webview.can_go_forward());
         self.update_bookmark_button();
         self.update_filter_button();
         self.focus_page_or_location();
-        self.queue_resize();
-        // Servo paints the newly shown page when it has a frame for it.
-        self.needs_paint.set(true);
-        Waker.wake();
     }
 
     /// Focuses the page, or the location field for a blank tab.
@@ -606,7 +691,7 @@ impl Browser {
         if tab.opened_blank && tab.location_text().is_empty() {
             self.widgets.location.grab_focus();
         } else {
-            tab.area.grab_focus();
+            tab.webview.grab_focus();
         }
     }
 
@@ -633,128 +718,16 @@ impl Browser {
             .is_some_and(|focused| focused.is_ancestor(&self.widgets.location))
     }
 
-    /// Runs `work`, which may use OpenGL, on Servo's OpenGL context.
-    ///
-    /// GTK may also be using OpenGL on this thread, and it remembers which
-    /// context it believes is current, so it has to be told to forget that.
-    fn with_servo_gl(&self, work: impl FnOnce()) {
-        if let Err(error) = self.rendering_context.make_current() {
-            eprintln!("Could not use the software OpenGL context: {error:?}");
-            return;
-        }
-        work();
-        gdk::GLContext::clear_current();
-    }
-
-    /// Lets Servo do whatever it has waiting, and shows any new frame.
-    fn spin(&self) {
-        let Some(servo) = self.servo().clone() else {
-            return;
-        };
-        if self.spinning.replace(true) {
-            // Something Servo called asked for this, so it has to wait its turn.
-            Waker.wake();
-            return;
-        }
-        self.with_servo_gl(|| {
-            if let (Some(size), Some(webview)) = (self.pending_size.take(), self.webview()) {
-                webview.resize(size);
-            }
-            servo.spin_event_loop();
-            if self.needs_paint.take() {
-                self.paint();
-            }
-        });
-        self.spinning.set(false);
-    }
-
-    fn paint(&self) {
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        tab.webview.paint();
-
-        let size = self.rendering_context.size2d().to_i32();
-        if let Some(image) = self
-            .rendering_context
-            .read_to_image(DeviceIntRect::from_size(size))
-        {
-            let (width, height) = image.dimensions();
-            let frame = gdk::MemoryTexture::new(
-                width as i32,
-                height as i32,
-                gdk::MemoryFormat::R8g8b8a8Premultiplied,
-                &glib::Bytes::from_owned(image.into_raw()),
-                width as usize * 4,
-            );
-            tab.area.set_frame(frame.upcast());
-        }
-        self.rendering_context.present();
-    }
-
-    /// Stops Servo, which is also when it saves cookies.
-    fn shut_down(&self) {
-        self.with_servo_gl(|| {
-            let tabs = self.tabs.take();
-            drop(tabs);
-            self.servo.replace(None);
-        });
-    }
-
     fn navigate(&self, url: Url) {
         if let Some(tab) = self.active_tab() {
-            tab.webview.load(url);
-            tab.area.grab_focus();
-            self.spin();
-        }
-    }
-
-    fn device_point(&self, x: f64, y: f64) -> DevicePoint {
-        let scale = self.widgets.window.scale_factor() as f32;
-        DevicePoint::new(x as f32 * scale, y as f32 * scale)
-    }
-
-    fn send_input(&self, id: WebViewId, event: InputEvent) {
-        if let Some(tab) = self.tab(id) {
-            tab.webview.notify_input_event(event);
-            self.spin();
-        }
-    }
-
-    /// Matches Servo's surface to the active tab's page area.
-    fn queue_resize(&self) {
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let area = &tab.area;
-        if area.width() == 0 || area.height() == 0 {
-            // It isn't laid out yet, and will say when it is.
-            return;
-        }
-        let scale = area.scale_factor();
-        let size = PhysicalSize::new(
-            (area.width() * scale).max(1) as u32,
-            (area.height() * scale).max(1) as u32,
-        );
-        if size != self.rendering_context.size() {
-            self.pending_size.set(Some(size));
-            // This is during GTK's layout, which is no time to do any rendering.
-            Waker.wake();
+            tab.crashed.replace(None);
+            tab.webview.load_uri(url.as_str());
+            tab.webview.grab_focus();
         }
     }
 
     fn connect_widgets(self: &Rc<Self>) {
         let widgets = &self.widgets;
-
-        widgets.window.connect_scale_factor_notify(|window| {
-            if let Some(browser) = current_browser() {
-                let scale = Scale::new(window.scale_factor() as f32);
-                for tab in browser.tabs.borrow().iter() {
-                    tab.webview.set_hidpi_scale_factor(scale);
-                }
-                browser.queue_resize();
-            }
-        });
 
         widgets.tabs.connect_page_notify(|_| {
             if let Some(browser) = current_browser() {
@@ -796,9 +769,8 @@ impl Browser {
         });
 
         widgets.window.connect_close_request(|_| {
-            if let Some(browser) = BROWSER.take() {
-                browser.shut_down();
-            }
+            // The tabs refer back to the browser, through their signal handlers.
+            BROWSER.take();
             glib::Propagation::Proceed
         });
     }
@@ -817,20 +789,17 @@ impl Browser {
 
         add_action("back", |browser| {
             if let Some(webview) = browser.webview() {
-                webview.go_back(1);
-                browser.spin();
+                webview.go_back();
             }
         });
         add_action("forward", |browser| {
             if let Some(webview) = browser.webview() {
-                webview.go_forward(1);
-                browser.spin();
+                webview.go_forward();
             }
         });
         add_action("reload", |browser| {
-            if let Some(webview) = browser.webview() {
-                webview.reload();
-                browser.spin();
+            if let Some(tab) = browser.active_tab() {
+                tab.reload();
             }
         });
         add_action("focus-location", |browser| {
@@ -839,13 +808,12 @@ impl Browser {
         add_action("new-tab", |_| {
             // Opening a tab needs the shared handle, rather than a borrowed one.
             if let Some(browser) = current_browser() {
-                browser.open_tab(Url::parse("about:blank").expect("about:blank is a valid URL"));
-                browser.spin();
+                browser.open_tab(None);
             }
         });
         add_action("close-tab", |browser| {
             if let Some(tab) = browser.active_tab() {
-                browser.close_tab(tab.id());
+                browser.close_tab(tab.id);
             }
         });
         add_action("next-tab", |browser| browser.select_tab_by_offset(1));
@@ -870,6 +838,7 @@ impl Browser {
             if let Some(browser) = current_browser() {
                 if let Some(tab) = browser.active_tab() {
                     tab.filtering.set(!tab.filtering.get());
+                    browser.apply_filters(&tab);
                 }
                 browser.update_filter_button();
             }
@@ -899,121 +868,6 @@ impl Browser {
         self.set_history_available(false, false);
     }
 
-    /// Sends input on a tab's page area to that tab's `WebView`.
-    fn connect_input(&self, area: &WebArea, id: WebViewId) {
-        area.connect_resized(move || {
-            if let Some(browser) = current_browser() {
-                if browser.is_active(id) {
-                    browser.queue_resize();
-                }
-            }
-        });
-
-        let motion = gtk::EventControllerMotion::new();
-        motion.connect_motion(move |_, x, y| {
-            if let Some(browser) = current_browser() {
-                let point = browser.device_point(x, y);
-                browser.pointer.set(point);
-                browser.send_input(id, InputEvent::MouseMove(MouseMoveEvent::new(point.into())));
-            }
-        });
-        motion.connect_leave(move |_| {
-            if let Some(browser) = current_browser() {
-                browser.send_input(
-                    id,
-                    InputEvent::MouseLeftViewport(MouseLeftViewportEvent::default()),
-                );
-            }
-        });
-        area.add_controller(motion);
-
-        let clicks = gtk::GestureClick::builder().button(0).build();
-        let send_click = move |gesture: &gtk::GestureClick, action, x, y| {
-            if let Some(browser) = current_browser() {
-                let point = browser.device_point(x, y);
-                browser.send_input(
-                    id,
-                    InputEvent::MouseButton(MouseButtonEvent::new(
-                        action,
-                        input::mouse_button(gesture.current_button()),
-                        point.into(),
-                    )),
-                );
-            }
-        };
-        clicks.connect_pressed(move |gesture, _, x, y| {
-            if let Some(widget) = gesture.widget() {
-                widget.grab_focus();
-            }
-            send_click(gesture, MouseButtonAction::Down, x, y);
-        });
-        clicks.connect_released(move |gesture, _, x, y| {
-            if gesture.current_button() == gdk::BUTTON_MIDDLE {
-                if let Some(browser) = current_browser() {
-                    let state = gesture.current_event_state();
-                    browser.middle_click.set(Some(MiddleClick {
-                        tab: id,
-                        at: Instant::now(),
-                        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
-                    }));
-                }
-            }
-            send_click(gesture, MouseButtonAction::Up, x, y);
-        });
-        area.add_controller(clicks);
-
-        let scrolling = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-        scrolling.connect_scroll(move |controller, dx, dy| {
-            if let Some(browser) = current_browser() {
-                // GTK's deltas are the way the pointer moved, and Servo's are the way the
-                // view moves.
-                let (x, y, mode) = match controller.unit() {
-                    gdk::ScrollUnit::Wheel => (
-                        -dx * WHEEL_NOTCH_PIXELS,
-                        -dy * WHEEL_NOTCH_PIXELS,
-                        WheelMode::DeltaLine,
-                    ),
-                    _ => {
-                        let scale = browser.widgets.window.scale_factor() as f64;
-                        (-dx * scale, -dy * scale, WheelMode::DeltaPixel)
-                    }
-                };
-                let delta = WheelDelta { x, y, z: 0.0, mode };
-                let point = browser.pointer.get().into();
-                browser.send_input(id, InputEvent::Wheel(WheelEvent::new(delta, point)));
-            }
-            glib::Propagation::Stop
-        });
-        area.add_controller(scrolling);
-
-        let keys = gtk::EventControllerKey::new();
-        keys.connect_key_pressed(move |_, key, _, modifiers| {
-            if let Some(browser) = current_browser() {
-                browser.send_input(id, input::keyboard_event(KeyState::Down, key, modifiers));
-            }
-            glib::Propagation::Stop
-        });
-        keys.connect_key_released(move |_, key, _, modifiers| {
-            if let Some(browser) = current_browser() {
-                browser.send_input(id, input::keyboard_event(KeyState::Up, key, modifiers));
-            }
-        });
-        area.add_controller(keys);
-
-        let focus = gtk::EventControllerFocus::new();
-        focus.connect_enter(move |_| {
-            if let Some(tab) = current_browser().and_then(|browser| browser.tab(id)) {
-                tab.webview.set_focused(true);
-            }
-        });
-        focus.connect_leave(move |_| {
-            if let Some(tab) = current_browser().and_then(|browser| browser.tab(id)) {
-                tab.webview.set_focused(false);
-            }
-        });
-        area.add_controller(focus);
-    }
-
     /// Enables the actions, which also takes care of their buttons and shortcuts.
     fn set_history_available(&self, can_go_back: bool, can_go_forward: bool) {
         let set_enabled = |name, enabled| {
@@ -1027,13 +881,10 @@ impl Browser {
     }
 
     fn toggle_bookmark(&self) {
-        if let Some(webview) = self.webview() {
-            if let Some(url) = webview.url() {
-                let title = webview.page_title().unwrap_or_else(|| url.to_string());
-                let result = self.bookmarks.borrow_mut().toggle(url.as_str(), &title);
-                if let Err(error) = result {
-                    eprintln!("Could not save bookmarks: {error}");
-                }
+        if let Some(page) = self.active_tab().and_then(|tab| tab.page()) {
+            let result = self.bookmarks.borrow_mut().toggle(&page.url, &page.title);
+            if let Err(error) = result {
+                eprintln!("Could not save bookmarks: {error}");
             }
         }
         self.bookmarks_changed();
@@ -1076,16 +927,10 @@ impl Browser {
 
     /// The active tab's page, as a bookmark of it would be.
     fn current_page(&self) -> Option<Bookmark> {
-        let webview = self.webview()?;
-        let url = webview.url()?;
-        if !matches!(url.scheme(), "http" | "https") {
-            return None;
-        }
-        let title = webview.page_title().unwrap_or_else(|| url.to_string());
-        Some(Bookmark {
-            url: url.to_string(),
-            title,
-        })
+        let page = self.active_tab()?.page()?;
+        let is_web_page = Url::parse(&page.url)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+        is_web_page.then_some(page)
     }
 
     fn edit_bookmarks(&self, edit: Edit) -> Result<(), String> {
@@ -1108,7 +953,8 @@ impl Browser {
         result
     }
 
-    /// Shows whether the active tab is filtered, and how much it blocked.
+    /// Shows whether the active tab is filtered. WebKit doesn't say what its
+    /// filters block, as blocked requests never reach this process.
     fn update_filter_button(&self) {
         let Some(tab) = self.active_tab() else {
             return;
@@ -1129,45 +975,112 @@ impl Browser {
         } else {
             "security-low-symbolic"
         });
-        let tooltip = if !filtering {
-            "Filtering is off for this tab".to_owned()
-        } else {
-            let blocked = match tab.blocked.get() {
-                1 => "1 request blocked".to_owned(),
-                count => format!("{count} requests blocked"),
-            };
-            if self.filter.borrow().rule_count() == 0 {
-                format!("{blocked}\nNo filter lists are in use yet")
-            } else {
-                blocked
-            }
+        let tooltip = match (filtering, self.filters.borrow().len()) {
+            (false, _) => "Filtering is off for this tab".to_owned(),
+            (true, 0) => "Filtering is on, but no filter lists are in use yet".to_owned(),
+            (true, 1) => "Filtering is on, with 1 filter list".to_owned(),
+            (true, count) => format!("Filtering is on, with {count} filter lists"),
         };
         button.set_tooltip_text(Some(&tooltip));
     }
 
-    /// Rebuilds the filter from the cached lists, in the background.
+    /// Converts the cached lists for WebKit, in the background, and compiles
+    /// those that changed. Then it uses them in every tab.
     fn reload_filters(&self) {
         let generation = self.filter_generation.get() + 1;
         self.filter_generation.set(generation);
         let enabled = self.filter_settings.borrow().enabled_lists();
-        let cache_dir = self.cache_dir.clone();
+        let cache_dir = self.dirs.cache.clone();
+        let store = self.filter_store.clone();
         glib::spawn_future_local(async move {
-            let built =
-                gio::spawn_blocking(move || filter_lists::build_engine(&cache_dir, &enabled)).await;
-            let (Some(browser), Ok((engine, statuses))) = (current_browser(), built) else {
+            let is_current = || {
+                current_browser().is_some_and(|browser| browser.filter_generation.get() == generation)
+            };
+            let directory = cache_dir.clone();
+            let converted =
+                gio::spawn_blocking(move || filter_lists::convert_lists(&directory, &enabled)).await;
+            let Ok((converted, mut statuses)) = converted else {
+                if let Some(browser) = current_browser() {
+                    browser.load_start_page();
+                }
                 return;
             };
-            if browser.filter_generation.get() != generation {
-                // A newer rebuild has started.
+            if !is_current() {
                 return;
             }
-            browser.filter.replace(Rc::new(engine));
+
+            let mut filters = Vec::new();
+            for list in converted {
+                let id = list.list.id;
+                let compiled = if filter_lists::is_compiled(&cache_dir, &list) {
+                    store.load_future(id).await.ok()
+                } else {
+                    None
+                };
+                let filter = match compiled {
+                    Some(filter) => Ok(filter),
+                    None => {
+                        // Compiling takes a while, and WebKit does it on another thread.
+                        let source = glib::Bytes::from_owned(list.json.clone().into_bytes());
+                        let saved = store.save_future(id, &source).await;
+                        if saved.is_ok() {
+                            if let Err(error) = filter_lists::mark_compiled(&cache_dir, &list) {
+                                eprintln!("Could not record compiling {id}: {error}");
+                            }
+                        }
+                        saved
+                    }
+                };
+                match filter {
+                    Ok(filter) => filters.push(filter),
+                    Err(error) => {
+                        if let Some(status) = statuses.get_mut(id) {
+                            status.problem = Some(error.message().to_owned());
+                        }
+                    }
+                }
+                if !is_current() {
+                    return;
+                }
+            }
+
+            let Some(browser) = current_browser() else {
+                return;
+            };
+            browser.filters.replace(filters);
+            for tab in browser.tabs.borrow().iter() {
+                browser.apply_filters(tab);
+            }
             browser.list_statuses.replace(statuses);
             if let Some(preferences) = browser.preferences.borrow().as_ref() {
                 preferences.show_statuses(&browser.list_statuses.borrow());
             }
             browser.update_filter_button();
+            browser.load_start_page();
         });
+    }
+
+    /// Loads the page that waited for the filters, if it's still there.
+    fn load_start_page(&self) {
+        let Some((id, url)) = self.start_page.take() else {
+            return;
+        };
+        if let Some(tab) = self.tab(id) {
+            if tab.webview.uri().is_none() {
+                tab.webview.load_uri(url.as_str());
+            }
+        }
+    }
+
+    /// Gives a tab the filters in use, or none if it isn't filtered. They apply
+    /// from the next page it loads.
+    fn apply_filters(&self, tab: &Tab) {
+        tab.content.remove_all_filters();
+        if tab.filtering.get() {
+            for filter in self.filters.borrow().iter() {
+                tab.content.add_filter(filter);
+            }
+        }
     }
 
     fn show_preferences(self: &Rc<Self>) {
@@ -1223,8 +1136,8 @@ impl Browser {
         }
         show(true, "Updating\u{2026}");
 
-        let cache_dir = self.cache_dir.clone();
-        let user_agent = format!("BrowseGoo/{VERSION}");
+        let cache_dir = self.dirs.cache.clone();
+        let user_agent = user_agent();
         glib::spawn_future_local(async move {
             let results = gio::spawn_blocking(move || {
                 lists
@@ -1273,9 +1186,9 @@ impl Browser {
 
     fn update_bookmark_button(&self) {
         let is_bookmarked = self
-            .webview()
-            .and_then(|webview| webview.url())
-            .is_some_and(|url| self.bookmarks.borrow().contains(url.as_str()));
+            .active_tab()
+            .and_then(|tab| tab.webview.uri())
+            .is_some_and(|url| self.bookmarks.borrow().contains(&url));
         let button = &self.widgets.bookmark;
         button.set_active(is_bookmarked);
         // BrowseGoo's own stars, as the theme's empty one is faded, like a
@@ -1320,182 +1233,9 @@ impl Browser {
     }
 }
 
-impl WebViewDelegate for Browser {
-    fn notify_new_frame_ready(&self, webview: WebView) {
-        // This arrives while Servo is busy, so it's painted when `spin` regains control.
-        if self.is_active(webview.id()) {
-            self.needs_paint.set(true);
-        }
-    }
-
-    fn notify_url_changed(&self, webview: WebView, _url: Url) {
-        let Some(tab) = self.tab(webview.id()) else {
-            return;
-        };
-        tab.update_label();
-        if self.is_active(tab.id()) {
-            if !self.is_editing_location() {
-                self.widgets.location_bar.set_text(&tab.location_text());
-            }
-            self.update_bookmark_button();
-        }
-    }
-
-    fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        let Some(tab) = self.tab(webview.id()) else {
-            return;
-        };
-        tab.title.replace(title.clone());
-        tab.update_label();
-        if self.is_active(tab.id()) {
-            self.set_window_title(title.as_deref());
-        }
-    }
-
-    fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
-        let Some(tab) = self.tab(webview.id()) else {
-            return;
-        };
-        let progress = match status {
-            LoadStatus::Started => 0.2,
-            LoadStatus::HeadParsed => 0.6,
-            LoadStatus::Complete | LoadStatus::Stopped => 0.0,
-        };
-        tab.progress.set(progress);
-        if status == LoadStatus::Started {
-            tab.blocked.set(0);
-        }
-        if self.is_active(tab.id()) {
-            self.widgets.location.set_progress_fraction(progress);
-            self.update_filter_button();
-        }
-    }
-
-    fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
-        let Some(tab) = self.tab(webview.id()) else {
-            return;
-        };
-        tab.can_go_back.set(current > 0);
-        tab.can_go_forward.set(current + 1 < entries.len());
-        if self.is_active(tab.id()) {
-            self.set_history_available(tab.can_go_back.get(), tab.can_go_forward.get());
-        }
-    }
-
-    fn notify_cursor_changed(&self, webview: WebView, cursor: Cursor) {
-        if let Some(tab) = self.tab(webview.id()) {
-            tab.area
-                .set_cursor_from_name(Some(input::cursor_name(cursor)));
-        }
-    }
-
-    /// A page that opens a new window, such as with a `target="_blank"` link or
-    /// a middle-click on a link, gets a new tab instead. A middle-click opens it
-    /// in the background, unless Shift is held.
-    fn request_create_new(&self, parent: WebView, request: CreateNewWebViewRequest) {
-        let Some(browser) = current_browser() else {
-            return;
-        };
-        // Servo doesn't say what the request is for, so it's taken to be from a
-        // middle-click if there was one on the page just before.
-        let middle_click = self
-            .middle_click
-            .take()
-            .filter(|click| click.tab == parent.id() && click.at.elapsed() < MIDDLE_CLICK_WINDOW);
-        let activate = middle_click.is_none_or(|click| click.shift);
-
-        let webview = browser
-            .webview_builder(request.builder(self.rendering_context.clone()))
-            .build();
-        browser.add_tab(webview, false, Some(parent.id()), activate);
-    }
-
-    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
-        let Some(tab) = self.tab(webview.id()) else {
-            return;
-        };
-        if !tab.filtering.get() || load.request.is_for_main_frame {
-            return;
-        }
-        let url = load.request.url.as_url();
-        let (Some(host), "http" | "https") = (url.host_str(), url.scheme()) else {
-            return;
-        };
-        let page_url = tab.webview.url();
-        let page_host = page_url.as_ref().and_then(Url::host_str);
-        let site = |host| filter::registrable_domain(host, servo::is_reg_domain);
-        let request = filter::Request {
-            url: url.as_str(),
-            page_host,
-            page_url: page_url.as_ref().map(Url::as_str),
-            third_party: page_host.is_some_and(|page_host| site(page_host) != site(host)),
-            resource_type: resource_type(load.request.destination),
-        };
-        if !self.filter.borrow().should_block(&request) {
-            return;
-        }
-
-        tab.blocked.set(tab.blocked.get() + 1);
-        if self.is_active(tab.id()) {
-            self.update_filter_button();
-        }
-        // Cancelling makes the request fail before it's sent.
-        let response = WebResourceResponse::new(url.clone());
-        load.intercept(response).cancel();
-    }
-
-    /// A page closed itself, such as with `window.close()`.
-    fn notify_closed(&self, webview: WebView) {
-        let id = webview.id();
-        // This arrives while Servo is busy, and closing a tab needs Servo.
-        glib::idle_add_local_once(move || close_tab_by_id(id));
-    }
-}
-
-fn resource_type(destination: Destination) -> ResourceType {
-    match destination {
-        Destination::Document => ResourceType::Document,
-        Destination::Frame | Destination::IFrame => ResourceType::Subdocument,
-        Destination::Script
-        | Destination::Worker
-        | Destination::SharedWorker
-        | Destination::ServiceWorker
-        | Destination::AudioWorklet
-        | Destination::PaintWorklet => ResourceType::Script,
-        Destination::Style | Destination::Xslt => ResourceType::Stylesheet,
-        Destination::Image => ResourceType::Image,
-        Destination::Font => ResourceType::Font,
-        Destination::Audio | Destination::Video | Destination::Track => ResourceType::Media,
-        Destination::Embed | Destination::Object => ResourceType::Object,
-        // Requests from `fetch()` and `XMLHttpRequest` have no destination.
-        Destination::None | Destination::Json => ResourceType::XmlHttpRequest,
-        Destination::Report => ResourceType::Ping,
-        Destination::Manifest | Destination::Text | Destination::WebIdentity => ResourceType::Other,
-    }
-}
-
-fn close_tab_by_id(id: WebViewId) {
+fn close_tab_by_id(id: TabId) {
     if let Some(browser) = current_browser() {
         browser.close_tab(id);
     }
 }
 
-impl ClipboardDelegate for Browser {
-    fn clear(&self, _webview: WebView) {
-        self.widgets.window.clipboard().set_text("");
-    }
-
-    fn get_text(&self, _webview: WebView, request: StringRequest) {
-        self.widgets
-            .window
-            .clipboard()
-            .read_text_async(None::<&gio::Cancellable>, move |result| match result {
-                Ok(text) => request.success(text.unwrap_or_default().into()),
-                Err(error) => request.failure(error.to_string()),
-            });
-    }
-
-    fn set_text(&self, _webview: WebView, new_contents: String) {
-        self.widgets.window.clipboard().set_text(&new_contents);
-    }
-}

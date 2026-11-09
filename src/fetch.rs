@@ -1,8 +1,8 @@
 //! Downloads files over HTTPS, for filter lists.
 //!
-//! Servo does the browser's own networking, but it has no API for fetching a
-//! file outside of a page. This is the minimum of HTTP/1.1 needed on top of
-//! rustls, with certificates checked against the system's trusted roots.
+//! WebKit does the networking for pages, in its own process. This is the
+//! minimum of HTTP/1.1 needed on top of rustls to fetch a list, with
+//! certificates checked against the system's trusted roots.
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;

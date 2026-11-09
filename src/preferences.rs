@@ -140,6 +140,9 @@ fn describe(status: &ListStatus) -> String {
         .and_then(|age| glib::DateTime::from_unix_local(age.as_secs() as i64).ok())
         .and_then(|time| time.format("%Y-%m-%d %H:%M").ok())
         .map_or_else(|| "at an unknown time".to_owned(), |time| time.to_string());
+    if let Some(problem) = &status.problem {
+        return format!("Downloaded {when}, but it couldn't be used: {problem}");
+    }
     match status.stats {
         Some(stats) => format!(
             "Downloaded {when}. Using {} rules, skipping {} unsupported ones.",

@@ -1,7 +1,7 @@
 # BrowseGoo
 
 BrowseGoo is a barebones Web browser, assembled around the
-[Servo](https://servo.org/) engine, with a [GTK4](https://www.gtk.org/) interface.
+[WebKit](https://webkitgtk.org/) engine, with a [GTK4](https://www.gtk.org/) interface.
 
 Created by AI Sloperator with Claude Code.
 
@@ -17,20 +17,25 @@ No license is given.
   and matching bookmarks are listed below the field, to choose with the arrow
   keys and Enter, or a click.
 - Tabs, which can be reordered by dragging. A link or script that would open a
-  new window opens a new tab instead. Middle-clicking a link opens it in a new
-  tab in the background, or with Shift held, switches to it. Tabs opened from a
-  page go after its tab, in the order they were opened.
-- HTTP and HTTPS. TLS is done by Servo, with `rustls`, and certificates are
-  checked with the system's trusted roots.
+  new window opens a new tab instead. Middle-clicking or Ctrl+clicking a link
+  opens it in a new tab in the background, or with Shift held, switches to it.
+  Tabs opened from a page go after its tab, in the order they were opened.
+- HTTP and HTTPS. TLS is done by WebKit, with GnuTLS through GLib, and
+  certificates are checked with the system's trusted roots.
 - Simple bookmarks: the star button adds or removes the current page, and the
   button next to it lists them. They can also be added, renamed, changed,
   reordered and deleted in the bookmarks editor, from the main menu (the button
   with three lines), which also has the preferences and About.
-- Filtering of ad and tracking requests, with lists like EasyList. The shield
-  button's tooltip says how many requests were blocked on the current page, and
-  its menu turns filtering off or on for the current tab, and opens the
-  preferences, where lists are enabled and downloaded.
-- Cookies that persist between runs, in Servo's own cookie store.
+- Filtering of ad and tracking requests, with lists like EasyList, in the
+  Adblock Plus format that uBlock Origin also uses. BrowseGoo converts the lists
+  to WebKit's content blocker rules, which WebKit compiles and applies. The
+  shield button's menu turns filtering off or on for the current tab, from its
+  next page load, and opens the preferences, where lists are enabled and
+  downloaded.
+- Cookies, and what sites store, such as with `localStorage`, persist between
+  runs.
+- Page content runs in separate, sandboxed processes. See
+  [Process isolation](#process-isolation).
 - The User-Agent is `BrowseGoo/` followed by the version.
 
 | Shortcut                    | Action               |
@@ -52,20 +57,24 @@ The Bookmarks, Preferences and About windows close with Ctrl+W or Escape, as
 well as with their close buttons. Closing the bookmarks editor keeps a change
 being typed, as leaving its field would, unless it isn't valid.
 
-Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`, with Servo's data, such as
-`cookie_jar.json`, beside them. Cookies are saved when the window is closed, so
-changes made since the last clean exit are lost in a crash.
+Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`. Cookies are in
+`~/.local/share/browsegoo/cookies.sqlite`, with what sites store beside them, and
+WebKit's cache is in `~/.cache/browsegoo/web/`.
 
 Which filter lists are enabled is in `~/.config/browsegoo/filter_lists.tsv`, and
-the downloaded lists are in `~/.cache/browsegoo/`. Lists are only downloaded with
-the Update Lists button in the preferences, so filtering does nothing until then.
+the downloaded lists are in `~/.cache/browsegoo/`, with WebKit's compiled
+versions in `compiled/` there. Lists are only downloaded with the Update Lists
+button in the preferences, so filtering does nothing until then. Compiling the
+four lists offered took about 15 seconds, and is only done again when a list
+changes. The compiled lists are large: about 90 MB for all four.
 
 ## Building
 
-You need stable Rust from [rustup](https://rustup.rs/), a C and C++ compiler, and
-the development files for GTK4. On Debian or Ubuntu, that is:
+You need stable Rust from [rustup](https://rustup.rs/), a C compiler, and the
+development files for GTK4 and WebKitGTK 6.0. On Debian 13 or Ubuntu 24.04 and
+later, that is:
 
-    sudo apt install build-essential pkg-config libgtk-4-dev
+    sudo apt install build-essential pkg-config libgtk-4-dev libwebkitgtk-6.0-dev
 
 The build also uses GLib's `glib-compile-resources`, which comes with those, to
 build BrowseGoo's icons in `resources` into the program.
@@ -73,33 +82,46 @@ build BrowseGoo's icons in `resources` into the program.
 Then:
 
     cargo build --release
-    ./target/release/browsegoo https://servo.org/
+    ./target/release/browsegoo https://www.aisloperator.com/
 
-The first build compiles about 550 crates, which took about 18 minutes on 2 CPU
-cores. It also downloads a prebuilt SpiderMonkey library, the JavaScript engine
-used by Servo.
+The first release build took about 2 minutes on 2 CPU cores. WebKit itself is
+the system's shared library, so it isn't compiled.
 
-Compiling Servo takes a lot of memory. A release build used about 5 GB in total,
-and worked with 8 GB of RAM. With only 4 GB, use the default profile and one job
-at a time, with `cargo build -j1`, which is set up to use less. If `rustc` gets
-killed while compiling `servo-script`, it ran out of memory.
+## Process isolation
 
-At run time, Servo needs a software OpenGL driver through EGL. On Debian and
-Ubuntu, that's in `libegl1` and `libgl1-mesa-dri`, which most desktops already have.
+BrowseGoo's own code is Rust, but WebKit, GTK and the libraries they use are C
+and C++, where a memory error can corrupt or take over the process it happens
+in. WebKitGTK already splits that work into separate processes:
+
+- Each page's HTML, CSS, JavaScript, images and media are handled in a web
+  process, `WebKitWebProcess`. These run in a
+  [bubblewrap](https://github.com/containers/bubblewrap) sandbox, which WebKitGTK
+  6.0 always uses: they see only a limited, mostly read-only view of the file
+  system, and reach D-Bus only through a filtering proxy.
+- Networking, including TLS and the cookie store, is in the network process,
+  `WebKitNetworkProcess`.
+
+So a memory error triggered by a page can only crash or take over its sandboxed
+web process, not the browser. When a web process crashes, BrowseGoo shows "This
+page crashed" in the tabs it served, and Reload loads the page again.
+
+What stays in the browser's process is GTK, the side of WebKit that drives those
+processes and displays their output, and BrowseGoo's own code. Downloaded filter
+lists are parsed and converted there, in Rust, and WebKit then compiles the
+converted rules there too, in C++, but only rules that BrowseGoo wrote, with
+their patterns escaped. Isolating any more of it would mean moving GTK's own
+drawing and input out of the process that has the window, which isn't
+practical.
 
 ## Known limitations
 
 This is a starting point, and these are not done yet:
 
-- Pages display through a software renderer, with each frame copied to GTK, so
-  it's slower than a GPU-accelerated browser.
-- Servo's features for WebGL, WebGPU, media playback and developer tools aren't
-  compiled in.
 - There's only one window.
-- There's no interface yet for `<select>` drop-downs, file pickers, color pickers,
-  context menus, HTTP authentication, or the `alert()`, `confirm()` and `prompt()`
-  dialogs.
-- Keyboard input doesn't go through an input method, so composed text doesn't work.
+- There's no interface for downloads, or for permission requests such as for
+  location or notifications, which are denied.
+- The shield button can't say how many requests were blocked, because WebKit
+  doesn't tell the browser about requests that its content blockers block.
 - Filtering only blocks requests by URL. It doesn't hide page elements, so blocked
   ads can leave empty space. Rules it can't apply correctly are skipped, such as
   regular expressions, redirects and scriptlets, and the preferences say how many.
