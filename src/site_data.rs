@@ -336,6 +336,9 @@ impl SiteDataWindow {
             .child(&columns)
             .vexpand(true)
             .has_frame(true)
+            // Scrollbars that show whenever there's more, rather than only
+            // when the pointer moves, which some themes don't hint at.
+            .overlay_scrolling(false)
             .build();
         content.append(&scrolled);
 
@@ -348,6 +351,7 @@ impl SiteDataWindow {
             .child(&details)
             .hscrollbar_policy(gtk::PolicyType::Never)
             .height_request(180)
+            .overlay_scrolling(false)
             .build();
         content.append(&details_scrolled);
 
