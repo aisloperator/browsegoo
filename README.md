@@ -36,7 +36,8 @@ No license is given.
   runs.
 - A Cookies and Site Data window, from the main menu, which lists each cookie,
   and each kind of other data that a site has stored, such as local storage or
-  IndexedDB. A field above the list filters it by site or name. Selecting one
+  IndexedDB. A field above the list filters it by site, or by name, and
+  checkboxes for each type of data filter it by type. Selecting one
   item shows more about it below, such as a cookie's whole value and when it
   expires, and the selected items can be deleted. Cookies are listed again as
   they change, and other data whenever the window is switched to, or with its

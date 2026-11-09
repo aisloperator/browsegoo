@@ -5,7 +5,7 @@
 //! storage, WebKit only says which sites have some, and only deletes all of a
 //! kind for a site, so each of those is one row.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
@@ -38,6 +38,22 @@ const STORED_KINDS: [(Types, &str); 11] = [
     (Types::DEVICE_ID_HASH_SALT, "Device ID salt"),
     (Types::ITP, "Tracking prevention"),
 ];
+
+const COOKIE_KIND: &str = "Cookie";
+
+/// Every kind of entry, in the order of the type checkboxes.
+fn kinds() -> impl Iterator<Item = &'static str> {
+    std::iter::once(COOKIE_KIND).chain(STORED_KINDS.iter().map(|(_, name)| *name))
+}
+
+/// Which entries the list shows, besides what's typed in the filter field.
+#[derive(Default)]
+struct FilterOptions {
+    /// Whether the text filters names, rather than sites.
+    by_name: Cell<bool>,
+    /// The kinds whose checkboxes are off.
+    hidden_kinds: RefCell<HashSet<&'static str>>,
+}
 
 /// Where an entry came from, which is what deleting it needs.
 enum Source {
@@ -90,7 +106,7 @@ impl Entry {
         ];
         Self {
             host,
-            kind: "Cookie",
+            kind: COOKIE_KIND,
             name,
             value,
             details,
@@ -141,9 +157,11 @@ impl Entry {
         listed_value(&self.value)
     }
 
-    /// Whether the site or name contains `filter`, which must be lowercase.
-    fn matches(&self, filter: &str) -> bool {
-        self.host.to_lowercase().contains(filter) || self.name.to_lowercase().contains(filter)
+    /// Whether the site, or with `by_name` the name, contains `filter`, which
+    /// must be lowercase.
+    fn matches(&self, filter: &str, by_name: bool) -> bool {
+        let field = if by_name { &self.name } else { &self.host };
+        field.to_lowercase().contains(filter)
     }
 }
 
@@ -237,8 +255,18 @@ impl SiteDataWindow {
             .build();
 
         let search = gtk::SearchEntry::builder()
-            .placeholder_text("Filter by site or name")
+            .placeholder_text("Filter")
             .hexpand(true)
+            .build();
+        let by_site = gtk::CheckButton::builder()
+            .label("Site")
+            .active(true)
+            .tooltip_text("Filter by site")
+            .build();
+        let by_name = gtk::CheckButton::builder()
+            .label("Name")
+            .group(&by_site)
+            .tooltip_text("Filter by name")
             .build();
         let refresh = gtk::Button::with_label("Refresh");
         refresh.set_tooltip_text(Some(
@@ -247,15 +275,43 @@ impl SiteDataWindow {
         ));
         let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         top.append(&search);
+        top.append(&by_site);
+        top.append(&by_name);
         top.append(&refresh);
         content.append(&top);
 
+        // Wraps onto more lines when the window is too narrow for them.
+        let kind_box = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .column_spacing(12)
+            .row_spacing(2)
+            .max_children_per_line(kinds().count() as u32)
+            .build();
+        let kind_checks: Vec<(&'static str, gtk::CheckButton)> = kinds()
+            .map(|kind| {
+                let check = gtk::CheckButton::builder().label(kind).active(true).build();
+                kind_box.insert(&check, -1);
+                // The checkbox takes the focus, rather than the box around it.
+                if let Some(child) = check.parent() {
+                    child.set_focusable(false);
+                }
+                (kind, check)
+            })
+            .collect();
+        content.append(&kind_box);
+
         let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let options = Rc::new(FilterOptions::default());
         let filter = {
             let search = search.downgrade();
+            let options = options.clone();
             gtk::CustomFilter::new(move |object| {
+                let entry = entry_of(object);
+                if options.hidden_kinds.borrow().contains(entry.kind) {
+                    return false;
+                }
                 let text = search.upgrade().map(|search| search.text().to_lowercase());
-                text.is_none_or(|text| entry_of(object).matches(text.trim()))
+                text.is_none_or(|text| entry.matches(text.trim(), options.by_name.get()))
             })
         };
         let filtered = gtk::FilterListModel::new(Some(store.clone()), Some(filter.clone()));
@@ -347,10 +403,32 @@ impl SiteDataWindow {
             this.show_details();
             this.show_count();
         });
-        this.search.connect_search_changed(move |_| {
+        let refilter = Rc::new(move || {
             filter.changed(gtk::FilterChange::Different);
             changed();
         });
+        let again = refilter.clone();
+        this.search.connect_search_changed(move |_| again());
+        let again = refilter.clone();
+        let options_now = options.clone();
+        by_name.connect_toggled(move |by_name| {
+            options_now.by_name.set(by_name.is_active());
+            again();
+        });
+        for (kind, check) in kind_checks {
+            let again = refilter.clone();
+            let options = options.clone();
+            check.connect_toggled(move |check| {
+                let mut hidden = options.hidden_kinds.borrow_mut();
+                if check.is_active() {
+                    hidden.remove(kind);
+                } else {
+                    hidden.insert(kind);
+                }
+                drop(hidden);
+                again();
+            });
+        }
         let changed = with(|this| {
             this.show_details();
             this.show_count();
@@ -642,6 +720,23 @@ mod tests {
         assert_eq!(listed_value(&long), format!("({} characters)", LONGEST_LISTED_VALUE + 1));
         let fits = "é".repeat(LONGEST_LISTED_VALUE);
         assert_eq!(listed_value(&fits), fits);
+    }
+
+    #[test]
+    fn filtering_by_site_or_name() {
+        let entry = Entry::from_cookie(soup::Cookie::new("SessionID", "1", ".Example.com", "/", 60));
+        assert!(entry.matches("example", false));
+        assert!(!entry.matches("session", false));
+        assert!(entry.matches("session", true));
+        assert!(!entry.matches("example", true));
+        assert!(entry.matches("", true));
+    }
+
+    #[test]
+    fn every_kind_has_a_checkbox() {
+        let kinds: Vec<_> = kinds().collect();
+        assert_eq!(kinds.len(), STORED_KINDS.len() + 1);
+        assert_eq!(kinds.iter().collect::<HashSet<_>>().len(), kinds.len());
     }
 
     #[test]
