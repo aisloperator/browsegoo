@@ -49,17 +49,13 @@ const CRASHED_PAGE: &str = "<!doctype html><title>Crashed</title>\
 /// `WebKitErrorBlockedByContentBlocker` on every platform.
 const BLOCKED_BY_CONTENT_BLOCKER: i32 = 104;
 
-/// What the blocked page's link goes to, which BrowseGoo handles itself.
-const LOAD_UNFILTERED_URL: &str = "browsegoo:load-unfiltered";
-
 /// What a tab shows instead of a page that a filter rule blocks.
 fn blocked_page(url: &str) -> String {
     format!(
         "<!doctype html><title>Blocked</title>\
          <body style=\"font: 16px sans-serif; margin: 3em\">\
          <h1 style=\"font-size: 1.5em\">This page is blocked</h1>\
-         <p>A filter rule blocks <span style=\"word-break: break-all\">{}</span>.</p>\
-         <p><a href=\"{LOAD_UNFILTERED_URL}\">Load it with filtering off for this tab</a></p>",
+         <p>A filter rule blocks <span style=\"word-break: break-all\">{}</span>.</p>",
         escape_html(url)
     )
 }
@@ -76,12 +72,6 @@ fn escape_html(text: &str) -> String {
 enum StandInReason {
     Crashed,
     Blocked,
-}
-
-/// The page that a page of BrowseGoo's own stands in for.
-struct StandIn {
-    url: String,
-    reason: StandInReason,
 }
 
 thread_local! {
@@ -137,9 +127,9 @@ struct Tab {
     filtering: Cell<bool>,
     /// The tab whose page opened this one, if any.
     opener: Option<TabId>,
-    /// The page that crashed or is blocked, if one of BrowseGoo's own pages
-    /// is shown instead.
-    stand_in: RefCell<Option<StandIn>>,
+    /// The address of the page that crashed or is blocked, if one of
+    /// BrowseGoo's own pages is shown instead.
+    stand_in: RefCell<Option<String>>,
     /// Whether that page of BrowseGoo's own is about to load, which isn't
     /// leaving it.
     loading_stand_in: Cell<bool>,
@@ -148,8 +138,8 @@ struct Tab {
 impl Tab {
     /// The URL to show in the location field, which is empty for a new tab.
     fn location_text(&self) -> String {
-        if let Some(stand_in) = self.stand_in.borrow().as_ref() {
-            return stand_in.url.clone();
+        if let Some(url) = self.stand_in.borrow().as_ref() {
+            return url.clone();
         }
         match self.webview.uri() {
             Some(url) if url != "about:blank" => url.to_string(),
@@ -189,7 +179,7 @@ impl Tab {
     /// blocked.
     fn reload(&self) {
         match self.stand_in.take() {
-            Some(stand_in) => self.webview.load_uri(&stand_in.url),
+            Some(url) => self.webview.load_uri(&url),
             None => self.webview.reload(),
         }
     }
@@ -200,17 +190,11 @@ impl Tab {
             StandInReason::Crashed => CRASHED_PAGE.to_owned(),
             StandInReason::Blocked => blocked_page(&url),
         };
-        self.stand_in.replace(Some(StandIn { url, reason }));
+        self.stand_in.replace(Some(url));
         self.loading_stand_in.set(true);
         self.webview.load_alternate_html(&html, "about:blank", None);
     }
 
-    fn is_blocked(&self) -> bool {
-        self.stand_in
-            .borrow()
-            .as_ref()
-            .is_some_and(|stand_in| stand_in.reason == StandInReason::Blocked)
-    }
 
     /// How far the page has loaded, for the location field, which shows
     /// nothing once it's done.
@@ -635,14 +619,6 @@ impl Browser {
             let Some(action) = decision.navigation_action() else {
                 return false;
             };
-            let requested = action.request().and_then(|request| request.uri());
-            if requested.as_deref() == Some(LOAD_UNFILTERED_URL) {
-                decision.ignore();
-                if let Some(browser) = current_browser() {
-                    browser.load_unfiltered(id);
-                }
-                return true;
-            }
             let modifiers = gdk::ModifierType::from_bits_truncate(action.modifiers());
             let new_tab = action.navigation_type() == webkit::NavigationType::LinkClicked
                 && (action.mouse_button() == gdk::BUTTON_MIDDLE
@@ -702,23 +678,6 @@ impl Browser {
             }
             tab.show_stand_in(url, StandInReason::Crashed);
         });
-    }
-
-    /// Turns filtering off for a tab whose page is blocked, and loads the page.
-    fn load_unfiltered(&self, id: TabId) {
-        let Some(tab) = self.tab(id) else {
-            return;
-        };
-        // Only from the blocked page, rather than from any page that links here.
-        if !tab.is_blocked() {
-            return;
-        }
-        tab.filtering.set(false);
-        self.apply_filters(&tab);
-        if self.is_active(id) {
-            self.update_filter_button();
-        }
-        tab.reload();
     }
 
     /// Shows a change in a tab's page, such as a new address or title.
