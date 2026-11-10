@@ -8,6 +8,7 @@ mod completion;
 mod fetch;
 mod filter;
 mod filter_lists;
+mod find_bar;
 mod location;
 mod location_bar;
 mod preferences;

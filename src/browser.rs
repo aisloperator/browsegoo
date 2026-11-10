@@ -22,6 +22,7 @@ use crate::VERSION;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::closing;
+use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
@@ -33,6 +34,9 @@ const INITIAL_WIDTH: i32 = 1024;
 const INITIAL_HEIGHT: i32 = 768;
 
 const NEW_TAB_TITLE: &str = "New Tab";
+
+/// Finding text in a page counts at most this many matches.
+pub const MOST_MATCHES: u32 = 1000;
 
 const CREDIT: &str = "Created by AI Sloperator with Claude Code";
 const WEBSITE: &str = "https://www.aisloperator.com/";
@@ -108,6 +112,7 @@ struct Widgets {
     bookmark: gtk::ToggleButton,
     bookmark_list: gtk::ListBox,
     bookmarks_popover: gtk::Popover,
+    find_bar: FindBar,
 }
 
 /// Identifies a tab, as WebKit views have no IDs of their own.
@@ -224,6 +229,8 @@ struct Browser {
     list_statuses: RefCell<BTreeMap<&'static str, ListStatus>>,
     /// Counts filter reloads, so that only the newest one is used.
     filter_generation: Cell<u64>,
+    /// The tab whose page was last searched with the find bar.
+    find_tab: Cell<Option<TabId>>,
     updating_lists: Cell<bool>,
     /// The page to load once the filters are first ready, so that it's filtered.
     start_page: RefCell<Option<(TabId, Url)>>,
@@ -279,6 +286,7 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
         filter_settings: RefCell::new(filter_settings),
         list_statuses: RefCell::new(BTreeMap::new()),
         filter_generation: Cell::new(0),
+        find_tab: Cell::new(None),
         updating_lists: Cell::new(false),
         start_page: RefCell::new(None),
         preferences: RefCell::new(None),
@@ -408,6 +416,8 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&toolbar);
     content.append(&pages);
+    let find_bar = FindBar::new();
+    content.append(&find_bar.revealer);
 
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -422,6 +432,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         window,
         tabs,
         pages,
+        find_bar,
         location_bar: LocationBar::new(
             &location,
             || {
@@ -663,6 +674,19 @@ impl Browser {
             glib::idle_add_local_once(move || close_tab_by_id(id));
         });
 
+        if let Some(finder) = webview.find_controller() {
+            let show = move |matches| {
+                if let Some(browser) = current_browser() {
+                    if browser.find_tab.get() == Some(id) {
+                        browser.widgets.find_bar.show_matches(Some(matches));
+                    }
+                }
+            };
+            let found = show.clone();
+            finder.connect_found_text(move |_, matches| found(matches));
+            finder.connect_failed_to_find_text(move |_| show(0));
+        }
+
         webview.connect_web_process_terminated(move |_, reason| {
             if reason == webkit::WebProcessTerminationReason::TerminatedByApi {
                 return;
@@ -743,7 +767,76 @@ impl Browser {
         self.set_history_available(active.webview.can_go_back(), active.webview.can_go_forward());
         self.update_bookmark_button();
         self.update_filter_button();
+        if self.widgets.find_bar.is_open() {
+            self.find(false);
+        }
         self.focus_page_or_location();
+    }
+
+    fn find_options(&self, backwards: bool) -> u32 {
+        let mut options = webkit::FindOptions::WRAP_AROUND;
+        if !self.widgets.find_bar.match_case.is_active() {
+            options |= webkit::FindOptions::CASE_INSENSITIVE;
+        }
+        if backwards {
+            options |= webkit::FindOptions::BACKWARDS;
+        }
+        options.bits()
+    }
+
+    /// Stops showing matches in the tab last searched, if there is one.
+    fn finish_finding(&self) {
+        let tab = self.find_tab.take().and_then(|id| self.tab(id));
+        if let Some(finder) = tab.and_then(|tab| tab.webview.find_controller()) {
+            finder.search_finish();
+        }
+    }
+
+    /// Looks for what's in the find bar in the active tab's page, from the
+    /// start, as when it's typed.
+    fn find(&self, backwards: bool) {
+        self.finish_finding();
+        let text = self.widgets.find_bar.text();
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(finder) = tab.webview.find_controller() else {
+            return;
+        };
+        if text.is_empty() {
+            self.widgets.find_bar.show_matches(None);
+            return;
+        }
+        self.find_tab.set(Some(tab.id));
+        finder.search(&text, self.find_options(backwards), MOST_MATCHES);
+    }
+
+    /// Goes to the next or previous match, opening the find bar if it's closed.
+    fn find_again(&self, backwards: bool) {
+        let bar = &self.widgets.find_bar;
+        if !bar.is_open() {
+            bar.open();
+        }
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let finder = tab.webview.find_controller();
+        let searched = finder.as_ref().and_then(|finder| finder.search_text());
+        let same_search = self.find_tab.get() == Some(tab.id)
+            && searched.is_some_and(|searched| searched == bar.text());
+        match finder {
+            Some(finder) if same_search && backwards => finder.search_previous(),
+            Some(finder) if same_search => finder.search_next(),
+            _ => self.find(backwards),
+        }
+    }
+
+    fn close_find_bar(&self) {
+        self.finish_finding();
+        self.widgets.find_bar.close();
+        if let Some(webview) = self.webview() {
+            webview.grab_focus();
+        }
     }
 
     /// Focuses the page, or the location field for a blank tab.
@@ -792,6 +885,41 @@ impl Browser {
 
     fn connect_widgets(self: &Rc<Self>) {
         let widgets = &self.widgets;
+
+        let find_bar = &widgets.find_bar;
+        let with_browser = |action: fn(&Browser)| {
+            move || {
+                if let Some(browser) = current_browser() {
+                    action(&browser);
+                }
+            }
+        };
+        let find = with_browser(|browser| browser.find(false));
+        find_bar.entry.connect_search_changed(move |_| find());
+        let find = with_browser(|browser| browser.find(false));
+        find_bar.match_case.connect_toggled(move |_| find());
+        let next = with_browser(|browser| browser.find_again(false));
+        find_bar.entry.connect_activate(move |_| next());
+        let next = with_browser(|browser| browser.find_again(false));
+        find_bar.next.connect_clicked(move |_| next());
+        let previous = with_browser(|browser| browser.find_again(true));
+        find_bar.previous.connect_clicked(move |_| previous());
+        let close = with_browser(Browser::close_find_bar);
+        find_bar.close.connect_clicked(move |_| close());
+        let close = with_browser(Browser::close_find_bar);
+        find_bar.entry.connect_stop_search(move |_| close());
+        // Shift+Enter, for the previous match.
+        let keys = gtk::EventControllerKey::new();
+        let previous = with_browser(|browser| browser.find_again(true));
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let enter = matches!(key, gdk::Key::Return | gdk::Key::KP_Enter);
+            if enter && modifiers.contains(gdk::ModifierType::SHIFT_MASK) {
+                previous();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        find_bar.entry.add_controller(keys);
 
         widgets.tabs.connect_page_notify(|_| {
             if let Some(browser) = current_browser() {
@@ -885,6 +1013,9 @@ impl Browser {
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
         add_action("site-data", Browser::show_site_data);
+        add_action("find", |browser| browser.widgets.find_bar.open());
+        add_action("find-next", |browser| browser.find_again(false));
+        add_action("find-previous", |browser| browser.find_again(true));
         add_action("user-filters", Browser::show_user_filters);
         add_action("edit-bookmarks", |_| {
             // The window needs the shared handle, rather than a borrowed one.
@@ -916,6 +1047,9 @@ impl Browser {
         app.set_accels_for_action("win.forward", &["<Alt>Right"]);
         app.set_accels_for_action("win.reload", &["<Control>r", "F5"]);
         app.set_accels_for_action("win.focus-location", &["<Control>l"]);
+        app.set_accels_for_action("win.find", &["<Control>f"]);
+        app.set_accels_for_action("win.find-next", &["<Control>g", "F3"]);
+        app.set_accels_for_action("win.find-previous", &["<Control><Shift>g", "<Shift>F3"]);
         app.set_accels_for_action("win.toggle-bookmark", &["<Control>d"]);
         app.set_accels_for_action("win.quit", &["<Control>q"]);
         app.set_accels_for_action("win.edit-bookmarks", &["<Control><Shift>o"]);

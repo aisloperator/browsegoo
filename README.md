@@ -22,6 +22,10 @@ No license is given.
   Tabs opened from a page go after its tab, in the order they were opened.
 - HTTP and HTTPS. TLS is done by WebKit, with GnuTLS through GLib, and
   certificates are checked with the system's trusted roots.
+- Finding text in the page as it's typed, in a bar that opens at the bottom of
+  the window, below the page. All matches are highlighted, and the bar says how
+  many there are, has a Match Case option, and closes with Escape. Enter and
+  Shift+Enter go to the next and previous match, in the bar.
 - Simple bookmarks: the star button adds or removes the current page, and the
   button next to it lists them. They can also be added, renamed, changed,
   reordered and deleted in the bookmarks editor, from the main menu (the button
@@ -64,6 +68,9 @@ No license is given.
 | Ctrl+W                      | Close tab            |
 | Ctrl+Tab, Ctrl+PageDown     | Next tab             |
 | Ctrl+Shift+Tab, Ctrl+PageUp | Previous tab         |
+| Ctrl+F                      | Find in page         |
+| Ctrl+G, F3                  | Find next            |
+| Ctrl+Shift+G, Shift+F3      | Find previous        |
 | Ctrl+D                      | Toggle bookmark      |
 | Ctrl+Shift+O                | Edit bookmarks       |
 | Ctrl+R, F5                  | Reload               |
