@@ -20,6 +20,12 @@ No license is given.
   new window opens a new tab instead. Middle-clicking or Ctrl+clicking a link
   opens it in a new tab in the background, or with Shift held, switches to it.
   Tabs opened from a page go after its tab, in the order they were opened.
+- A title bar that suits the desktop. On X11, the window manager's own title bar
+  and ways of managing windows are used, and the tabs are at the top of the
+  window. On Wayland, where each program draws its own, the tabs are in the
+  title bar, with buttons for minimizing, maximizing and closing as the desktop
+  has them set. Setting the environment variable `GTK_CSD` to 1 puts the tabs in
+  the title bar on X11 too.
 - HTTP and HTTPS. TLS is done by WebKit, with GnuTLS through GLib, and
   certificates are checked with the system's trusted roots.
 - Finding text in the page as it's typed, in a bar that opens at the bottom of

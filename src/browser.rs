@@ -1,9 +1,10 @@
 //! The browser window, its tabs, and their WebKit views.
 //!
-//! The tabs are in the title bar, above the toolbar. A `gtk::Notebook` puts
-//! each page right under the tabs, with no room for a shared toolbar, so the
-//! notebook only provides the tabs, with an empty placeholder as each one's
-//! page, and the pages themselves are in a `gtk::Stack` below the toolbar.
+//! The tabs are above the toolbar, in the title bar when the window draws its
+//! own (see `decorations`). A `gtk::Notebook` puts each page right under the
+//! tabs, with no room for a shared toolbar, so the notebook only provides the
+//! tabs, with an empty placeholder as each one's page, and the pages
+//! themselves are in a `gtk::Stack` below the toolbar.
 //!
 //! WebKit runs each page's content in separate, sandboxed processes, and does
 //! its networking in another. This process only has the user interface.
@@ -22,6 +23,7 @@ use crate::VERSION;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::closing;
+use crate::decorations;
 use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
@@ -406,14 +408,20 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .build();
     tabs.set_action_widget(&new_tab, gtk::PackType::End);
 
-    // The empty parts of the title bar still move the window, as usual.
-    let title_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    title_bar.append(&tabs);
-    title_bar.append(&gtk::WindowControls::new(gtk::PackType::End));
-    let title_bar = gtk::WindowHandle::builder().child(&title_bar).build();
-
     let pages = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let title_bar = if decorations::draw_own_title_bar() {
+        // The empty parts of the title bar still move the window, as usual.
+        let title_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        title_bar.append(&tabs);
+        title_bar.append(&gtk::WindowControls::new(gtk::PackType::End));
+        Some(gtk::WindowHandle::builder().child(&title_bar).build())
+    } else {
+        // The window manager's title bar is above, so the tabs are at the top
+        // of the window's content.
+        content.append(&tabs);
+        None
+    };
     content.append(&toolbar);
     content.append(&pages);
     let find_bar = FindBar::new();
@@ -424,9 +432,11 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .title("BrowseGoo")
         .default_width(INITIAL_WIDTH)
         .default_height(INITIAL_HEIGHT)
-        .titlebar(&title_bar)
         .child(&content)
         .build();
+    if let Some(title_bar) = &title_bar {
+        window.set_titlebar(Some(title_bar));
+    }
 
     Widgets {
         window,

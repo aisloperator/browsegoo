@@ -5,6 +5,7 @@ mod bookmarks_editor;
 mod browser;
 mod closing;
 mod completion;
+mod decorations;
 mod fetch;
 mod filter;
 mod filter_lists;
