@@ -155,6 +155,22 @@ impl UserFiltersWindow {
         self.window.present();
     }
 
+    /// Shows that `added` was added to the end of the rules, which are now
+    /// `applied`. Any changes not yet applied are kept.
+    pub fn show_added(&self, applied: &str, added: &str) {
+        if !self.editable.get() {
+            return;
+        }
+        // Inserted rather than set, to keep the cursor where it was.
+        let text = self.text();
+        let appended = crate::block_sites::append_rules(&text, added);
+        self.applied.replace(applied.to_owned());
+        self.applied_status.replace("Applying…".to_owned());
+        self.buffer
+            .insert(&mut self.buffer.end_iter(), &appended[text.len()..]);
+        self.show_state();
+    }
+
     fn text(&self) -> String {
         let (start, end) = self.buffer.bounds();
         self.buffer.text(&start, &end, false).to_string()

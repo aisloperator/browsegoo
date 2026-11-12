@@ -63,6 +63,11 @@ No license is given.
   Refresh button, as WebKit doesn't say when that changes. WebKit only deletes
   a kind of data other than cookies for a whole site at once, such as all of a
   site's local storage, so that's one item.
+- The Cookies and Site Data window's Block button writes a rule for each site
+  of the selected items, such as `||ads.example.com^$important`, which blocks
+  everything from the site and its subdomains, even where there's an exception.
+  They can be changed before Apply adds them to the end of your filter rules.
+  The items stay selected, to delete them too if wanted.
 - Page content runs in separate, sandboxed processes. See
   [Process isolation](#process-isolation).
 - The User-Agent is `BrowseGoo/` followed by the version.

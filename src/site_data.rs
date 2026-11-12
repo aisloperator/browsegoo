@@ -15,6 +15,7 @@ use gtk::{gio, glib};
 use webkit::WebsiteDataTypes as Types;
 use webkit::soup;
 
+use crate::block_sites;
 use crate::closing;
 
 /// Longer values are only shown below the list, when their row is selected.
@@ -231,6 +232,9 @@ pub struct SiteDataWindow {
     details: gtk::Grid,
     count: gtk::Label,
     delete: gtk::Button,
+    block: gtk::Button,
+    /// Adds rules to the end of the user's own.
+    add_rules: Rc<dyn Fn(&str) -> Result<(), String>>,
     cookies: webkit::CookieManager,
     data: webkit::WebsiteDataManager,
     /// Counts listings, so that only the newest one is shown.
@@ -244,6 +248,7 @@ impl SiteDataWindow {
         parent: &gtk::ApplicationWindow,
         cookies: webkit::CookieManager,
         data: webkit::WebsiteDataManager,
+        add_rules: impl Fn(&str) -> Result<(), String> + 'static,
     ) -> Rc<Self> {
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -361,8 +366,14 @@ impl SiteDataWindow {
             .sensitive(false)
             .css_classes(["destructive-action"])
             .build();
+        let block = gtk::Button::builder()
+            .label("Block…")
+            .sensitive(false)
+            .tooltip_text("Write filter rules that block the selected items' sites")
+            .build();
         let bottom = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         bottom.append(&count);
+        bottom.append(&block);
         bottom.append(&delete);
         content.append(&bottom);
 
@@ -386,6 +397,8 @@ impl SiteDataWindow {
             details,
             count,
             delete,
+            block,
+            add_rules: Rc::new(add_rules),
             cookies,
             data,
             generation: Cell::new(0),
@@ -445,6 +458,8 @@ impl SiteDataWindow {
         refresh.connect_clicked(move |_| refresh_now());
         let delete_selected = with(Self::delete_selected);
         this.delete.connect_clicked(move |_| delete_selected());
+        let block_selected = with(Self::block_selected);
+        this.block.connect_clicked(move |_| block_selected());
 
         let delete_selected = with(Self::delete_selected);
         let shortcuts = gtk::ShortcutController::new();
@@ -576,6 +591,7 @@ impl SiteDataWindow {
         }
         self.count.set_text(&text);
         self.delete.set_sensitive(selected > 0 && !self.deleting.get());
+        self.block.set_sensitive(selected > 0);
     }
 
     /// Shows more about the selected entry, if just one is selected.
@@ -624,6 +640,23 @@ impl SiteDataWindow {
             self.details.attach(&label, 0, row as i32, 1, 1);
             self.details.attach(&text, 1, row as i32, 1, 1);
         }
+    }
+
+    /// Opens a window with rules for blocking the selected entries' sites,
+    /// which leaves them selected, to delete next if need be.
+    fn block_selected(self: &Rc<Self>) {
+        let selected = self.selected();
+        if selected.is_empty() {
+            return;
+        }
+        let hosts: Vec<String> = selected
+            .iter()
+            .map(|object| entry_of(object).host.clone())
+            .collect();
+        let add_rules = self.add_rules.clone();
+        block_sites::show(&self.window, hosts.iter().map(String::as_str), move |rules| {
+            add_rules(rules)
+        });
     }
 
     fn delete_selected(self: &Rc<Self>) {

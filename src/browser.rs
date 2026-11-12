@@ -22,6 +22,7 @@ use webkit::prelude::*;
 use crate::VERSION;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
+use crate::block_sites;
 use crate::closing;
 use crate::decorations;
 use crate::find_bar::FindBar;
@@ -1132,6 +1133,20 @@ impl Browser {
         }
     }
 
+    /// Adds `added` to the end of the user's rules, and starts using them.
+    fn add_user_rules(&self, added: &str) -> Result<(), String> {
+        let rules = filter_lists::load_user_rules(&self.dirs.config)
+            .map_err(|error| format!("Your rules couldn't be read: {error}"))?;
+        let rules = block_sites::append_rules(&rules, added);
+        filter_lists::save_user_rules(&self.dirs.config, &rules)
+            .map_err(|error| format!("Your rules couldn't be saved: {error}"))?;
+        if let Some(window) = self.user_filters.borrow().as_ref() {
+            window.show_added(&rules, added);
+        }
+        self.reload_filters();
+        Ok(())
+    }
+
     fn show_user_filters_status(&self) {
         if let Some(window) = self.user_filters.borrow().as_ref() {
             let statuses = self.list_statuses.borrow();
@@ -1147,7 +1162,12 @@ impl Browser {
             ) else {
                 return;
             };
-            let window = SiteDataWindow::new(&self.widgets.window, cookies, data);
+            let window = SiteDataWindow::new(&self.widgets.window, cookies, data, |rules| {
+                match current_browser() {
+                    Some(browser) => browser.add_user_rules(rules),
+                    None => Ok(()),
+                }
+            });
             self.site_data.replace(Some(window));
         }
         let window = self.site_data.borrow().clone();
