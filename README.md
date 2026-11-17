@@ -49,9 +49,12 @@ Portions Copyright.  No license is given.
   button's menu, and its Apply button saves them and starts using them, from
   each tab's next page load. The window says how many rules are used, and which
   lines aren't applied, such as element hiding rules.
-- Cookies, and what sites store, such as with `localStorage`, persist between
-  runs.
-- A Cookies and Site Data window, from the main menu, which lists each cookie,
+- Cookies, and what sites store, such as with `localStorage`, are deleted when
+  BrowseGoo quits, except for what's chosen to be preserved in the Site Data
+  Manager. They're also deleted when it starts, before it loads anything, in
+  case it didn't quit cleanly. If deleting takes more than 10 seconds when
+  quitting, BrowseGoo quits anyway and deletes the rest the next time it starts.
+- A Site Data Manager window, from the main menu, which lists each cookie,
   and each kind of other data that a site has stored, such as local storage or
   IndexedDB. A field above the list filters it by site, or by name, and
   checkboxes for each type of data filter it by type. Selecting one
@@ -61,7 +64,10 @@ Portions Copyright.  No license is given.
   Refresh button, as WebKit doesn't say when that changes. WebKit only deletes
   a kind of data other than cookies for a whole site at once, such as all of a
   site's local storage, so that's one item.
-- The Cookies and Site Data window's Block button writes a rule for each site
+- A Preserve checkbox for each item in the Site Data Manager, off at first,
+  which keeps that item when BrowseGoo quits. It stays checked if the item is
+  deleted, so that the site can store it again and have it kept.
+- The Site Data Manager's Block button writes a rule for each site
   of the selected items, such as `||ads.example.com^$important`, which blocks
   everything from the site and its subdomains, even where there's an exception.
   They can be changed before Apply adds them to the end of your filter rules.
@@ -94,7 +100,8 @@ being typed, as leaving its field would, unless it isn't valid.
 
 Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`. Cookies are in
 `~/.local/share/browsegoo/cookies.sqlite`, with what sites store beside them, and
-WebKit's cache is in `~/.cache/browsegoo/web/`.
+WebKit's cache is in `~/.cache/browsegoo/web/`. Which of them are preserved is
+in `~/.config/browsegoo/preserved_site_data.tsv`.
 
 Which filter lists are enabled is in `~/.config/browsegoo/filter_lists.tsv`, and
 the downloaded lists are in `~/.cache/browsegoo/`, with WebKit's compiled

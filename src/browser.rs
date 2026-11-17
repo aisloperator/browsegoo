@@ -30,13 +30,18 @@ use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
 use crate::preferences::PreferencesWindow;
-use crate::site_data::SiteDataWindow;
+use crate::preserved::Preserved;
+use crate::site_data::{self, SiteDataWindow};
 use crate::user_filters::UserFiltersWindow;
 
 const INITIAL_WIDTH: i32 = 1024;
 const INITIAL_HEIGHT: i32 = 768;
 
 const NEW_TAB_TITLE: &str = "New Tab";
+
+/// How long quitting waits for the site data that isn't preserved to be
+/// deleted. What's left is deleted the next time BrowseGoo starts.
+const DELETING_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Finding text in a page counts at most this many matches.
 pub const MOST_MATCHES: u32 = 1000;
@@ -224,6 +229,10 @@ struct Browser {
     network_session: webkit::NetworkSession,
     settings: webkit::Settings,
     bookmarks: RefCell<Bookmarks>,
+    /// The cookies and site data that aren't deleted on quitting.
+    preserved: Rc<RefCell<Preserved>>,
+    /// Whether the site data is being deleted, before quitting.
+    quitting: Cell<bool>,
     /// Where WebKit keeps the compiled filter lists.
     filter_store: webkit::UserContentFilterStore,
     /// The compiled filter lists in use.
@@ -243,7 +252,8 @@ struct Browser {
     user_filters: RefCell<Option<Rc<UserFiltersWindow>>>,
 }
 
-/// Opens the browser window at `start_url`.
+/// Opens the browser window at `start_url`, once the cookies and site data
+/// that aren't preserved are deleted, in case BrowseGoo didn't quit cleanly.
 pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
     if current_browser().is_some() {
         return;
@@ -258,6 +268,37 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
             cookies.set_persistent_storage(path, webkit::CookiePersistentStorage::Sqlite);
         }
     }
+    let preserved = Preserved::load(dirs.config.join("preserved_site_data.tsv"))
+        .unwrap_or_else(|error| {
+            // Carrying on would delete what was meant to be preserved.
+            eprintln!("Could not read which site data to preserve: {error}");
+            std::process::exit(1);
+        });
+    let preserved = Rc::new(RefCell::new(preserved));
+
+    // Nothing is loaded until this is done, and the application waits for it,
+    // though it has no window yet.
+    let hold = app.hold();
+    let app = app.clone();
+    glib::spawn_future_local(async move {
+        if let (Some(cookies), Some(data)) = (
+            network_session.cookie_manager(),
+            network_session.website_data_manager(),
+        ) {
+            site_data::delete_unpreserved(&cookies, &data, &preserved).await;
+        }
+        open_window(&app, dirs, start_url, network_session, preserved);
+        drop(hold);
+    });
+}
+
+fn open_window(
+    app: &gtk::Application,
+    dirs: Dirs,
+    start_url: Url,
+    network_session: webkit::NetworkSession,
+    preserved: Rc<RefCell<Preserved>>,
+) {
     let settings = webkit::Settings::new();
     settings.set_user_agent(Some(&user_agent()));
 
@@ -284,6 +325,8 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
         network_session,
         settings,
         bookmarks: RefCell::new(bookmarks),
+        preserved,
+        quitting: Cell::new(false),
         filter_store,
         filters: RefCell::new(Vec::new()),
         filter_settings: RefCell::new(filter_settings),
@@ -329,7 +372,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let reload = icon_button("view-refresh-symbolic", "Reload (Ctrl+R)", "win.reload");
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Bookmarks"), Some("win.edit-bookmarks"));
-    main_menu.append(Some("Cookies and Site Data"), Some("win.site-data"));
+    main_menu.append(Some("Site Data Manager"), Some("win.site-data"));
     main_menu.append(Some("Your Filter Rules"), Some("win.user-filters"));
     main_menu.append(Some("Preferences"), Some("win.preferences"));
     main_menu.append(Some("About BrowseGoo"), Some("win.about"));
@@ -971,10 +1014,12 @@ impl Browser {
             }
         });
 
-        widgets.window.connect_close_request(|_| {
-            // The tabs refer back to the browser, through their signal handlers.
-            BROWSER.take();
-            glib::Propagation::Proceed
+        widgets.window.connect_close_request(|_| match current_browser() {
+            Some(browser) => {
+                browser.quit();
+                glib::Propagation::Stop
+            }
+            None => glib::Propagation::Proceed,
         });
     }
 
@@ -1154,6 +1199,38 @@ impl Browser {
         }
     }
 
+    /// Deletes the cookies and site data that aren't preserved, and then
+    /// closes the window, which quits.
+    fn quit(&self) {
+        if self.quitting.replace(true) {
+            return;
+        }
+        for window in gtk::Window::list_toplevels() {
+            window.set_visible(false);
+        }
+        // So that pages can't store anything more while it's being deleted.
+        for tab in self.tabs.borrow().iter() {
+            tab.webview.terminate_web_process();
+        }
+        let window = self.widgets.window.clone();
+        let cookies = self.network_session.cookie_manager();
+        let data = self.network_session.website_data_manager();
+        let preserved = self.preserved.clone();
+        glib::spawn_future_local(async move {
+            if let (Some(cookies), Some(data)) = (cookies, data) {
+                let deleting = site_data::delete_unpreserved(&cookies, &data, &preserved);
+                if glib::future_with_timeout(DELETING_TIME_LIMIT, deleting).await.is_err() {
+                    eprintln!("Quitting before all the site data that isn't preserved was deleted");
+                }
+            }
+            // The tabs refer back to the browser, through their signal handlers.
+            BROWSER.take();
+            // Closing a hidden window might do nothing, so it's destroyed,
+            // which leaves the application with no window, so it quits.
+            window.destroy();
+        });
+    }
+
     fn show_site_data(&self) {
         if self.site_data.borrow().is_none() {
             let (Some(cookies), Some(data)) = (
@@ -1162,12 +1239,16 @@ impl Browser {
             ) else {
                 return;
             };
-            let window = SiteDataWindow::new(&self.widgets.window, cookies, data, |rules| {
-                match current_browser() {
+            let window = SiteDataWindow::new(
+                &self.widgets.window,
+                cookies,
+                data,
+                self.preserved.clone(),
+                |rules| match current_browser() {
                     Some(browser) => browser.add_user_rules(rules),
                     None => Ok(()),
-                }
-            });
+                },
+            );
             self.site_data.replace(Some(window));
         }
         let window = self.site_data.borrow().clone();

@@ -1,9 +1,12 @@
-//! The Cookies and Site Data window, for looking at what sites have stored,
-//! and deleting it.
+//! The Site Data Manager window, for looking at what sites have stored,
+//! choosing what of it to preserve, and deleting it.
 //!
 //! Cookies are listed one by one. For the other kinds of data, such as local
 //! storage, WebKit only says which sites have some, and only deletes all of a
 //! kind for a site, so each of those is one row.
+//!
+//! What isn't preserved is deleted by `delete_unpreserved`, when BrowseGoo
+//! quits and when it starts.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -17,6 +20,7 @@ use webkit::soup;
 
 use crate::block_sites;
 use crate::closing;
+use crate::preserved::Preserved;
 
 /// Longer values are only shown below the list, when their row is selected.
 const LONGEST_LISTED_VALUE: usize = 60;
@@ -144,7 +148,8 @@ impl Entry {
             .collect()
     }
 
-    /// Identifies the entry from one listing to the next, to keep it selected.
+    /// Identifies the entry from one listing to the next, to keep it selected,
+    /// and from one run to the next, to preserve it.
     fn key(&self) -> String {
         let path = match &self.source {
             Source::Cookie(cookie) => cookie.clone().path().map(String::from).unwrap_or_default(),
@@ -248,6 +253,7 @@ impl SiteDataWindow {
         parent: &gtk::ApplicationWindow,
         cookies: webkit::CookieManager,
         data: webkit::WebsiteDataManager,
+        preserved: Rc<RefCell<Preserved>>,
         add_rules: impl Fn(&str) -> Result<(), String> + 'static,
     ) -> Rc<Self> {
         let content = gtk::Box::builder()
@@ -330,6 +336,7 @@ impl SiteDataWindow {
         let selection = gtk::MultiSelection::new(Some(sorted));
         columns.set_model(Some(&selection));
 
+        add_preserve_column(&columns, &preserved);
         let site = add_column(&columns, "Site", 200, |entry| entry.host.clone());
         add_column(&columns, "Type", 130, |entry| entry.kind.to_owned());
         add_column(&columns, "Name", 160, |entry| entry.name.clone());
@@ -378,7 +385,7 @@ impl SiteDataWindow {
         content.append(&bottom);
 
         let window = gtk::Window::builder()
-            .title("Cookies and Site Data")
+            .title("Site Data Manager")
             .transient_for(parent)
             .default_width(820)
             .default_height(680)
@@ -672,7 +679,7 @@ impl SiteDataWindow {
             for object in selected {
                 let result = match &entry_of(&object).source {
                     Source::Cookie(cookie) => cookies.delete_cookie_future(cookie).await,
-                    Source::Stored(site, kind) => remove_data(&data, site, *kind).await,
+                    Source::Stored(site, kind) => remove_data(&data, std::slice::from_ref(site), *kind).await,
                 };
                 if let Err(error) = result {
                     eprintln!("Could not delete {}: {error}", entry_of(&object).key());
@@ -686,18 +693,123 @@ impl SiteDataWindow {
     }
 }
 
-/// Deletes one kind of data that a site has stored.
+/// Deletes all cookies and site data, except what's preserved.
+pub async fn delete_unpreserved(
+    cookies: &webkit::CookieManager,
+    data: &webkit::WebsiteDataManager,
+    preserved: &RefCell<Preserved>,
+) {
+    let is_preserved = |entry: &Entry| preserved.borrow().contains(&entry.key());
+    match cookies.all_cookies_future().await {
+        Ok(all) => {
+            for entry in all.into_iter().map(Entry::from_cookie) {
+                if let (false, Source::Cookie(cookie)) = (is_preserved(&entry), &entry.source) {
+                    if let Err(error) = cookies.delete_cookie_future(cookie).await {
+                        eprintln!("Could not delete {}: {error}", entry.key());
+                    }
+                }
+            }
+        }
+        Err(error) => eprintln!("Could not list cookies to delete: {error}"),
+    }
+    match data.fetch_future(Types::ALL & !Types::COOKIES).await {
+        Ok(stored) => {
+            let entries: Vec<Entry> = stored
+                .iter()
+                .flat_map(Entry::from_stored)
+                .filter(|entry| !is_preserved(entry))
+                .collect();
+            // One request for each kind, for all the sites that have it.
+            for (kind, kind_name) in STORED_KINDS {
+                let sites: Vec<webkit::WebsiteData> = entries
+                    .iter()
+                    .filter_map(|entry| match &entry.source {
+                        Source::Stored(site, _) if entry.kind == kind_name => Some(site.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if sites.is_empty() {
+                    continue;
+                }
+                if let Err(error) = remove_data(data, &sites, kind).await {
+                    eprintln!("Could not delete {}: {error}", kind_name.to_lowercase());
+                }
+            }
+        }
+        Err(error) => eprintln!("Could not list site data to delete: {error}"),
+    }
+}
+
+/// Deletes one kind of data that sites have stored.
 fn remove_data(
     manager: &webkit::WebsiteDataManager,
-    site: &webkit::WebsiteData,
+    sites: &[webkit::WebsiteData],
     kind: Types,
 ) -> impl Future<Output = Result<(), glib::Error>> + use<> {
-    let site = site.clone();
+    let sites = sites.to_vec();
     gio::GioFuture::new(manager, move |manager, cancellable, send| {
-        manager.remove(kind, &[&site], Some(cancellable), move |result| {
+        let sites: Vec<&webkit::WebsiteData> = sites.iter().collect();
+        manager.remove(kind, &sites, Some(cancellable), move |result| {
             send.resolve(result);
         });
     })
+}
+
+/// Adds the column of checkboxes for preserving entries, which sorts the
+/// preserved ones first.
+fn add_preserve_column(columns: &gtk::ColumnView, preserved: &Rc<RefCell<Preserved>>) {
+    let factory = gtk::SignalListItemFactory::new();
+    let saving = preserved.clone();
+    factory.connect_setup(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let check = gtk::CheckButton::builder()
+            .halign(gtk::Align::Center)
+            .tooltip_text("Keep this when BrowseGoo quits")
+            .build();
+        let item_now = item.downgrade();
+        let preserved = saving.clone();
+        // Binding an entry sets the checkbox to what's saved, which changes nothing.
+        check.connect_toggled(move |check| {
+            let Some(object) = item_now.upgrade().and_then(|item| item.item()) else {
+                return;
+            };
+            let key = entry_of(&object).key();
+            let result = preserved.borrow_mut().set(&key, check.is_active());
+            if let Err(error) = result {
+                eprintln!("Could not save which site data to preserve: {error}");
+                check.set_active(!check.is_active());
+            }
+        });
+        item.set_child(Some(&check));
+    });
+    let showing = preserved.clone();
+    factory.connect_bind(move |_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        if let (Some(object), Some(check)) =
+            (item.item(), item.child().and_downcast::<gtk::CheckButton>())
+        {
+            let key = entry_of(&object).key();
+            let preserve = showing.borrow().contains(&key);
+            check.set_active(preserve);
+        }
+    });
+    let sorting = preserved.clone();
+    let sorter = gtk::CustomSorter::new(move |a, b| {
+        let preserved = sorting.borrow();
+        let is_preserved = |object: &glib::Object| preserved.contains(&entry_of(object).key());
+        is_preserved(b).cmp(&is_preserved(a)).into()
+    });
+    let column = gtk::ColumnViewColumn::builder()
+        .title("Preserve")
+        .factory(&factory)
+        .sorter(&sorter)
+        .resizable(true)
+        .build();
+    columns.append_column(&column);
 }
 
 /// Adds a column that shows `text` for each entry, and sorts by it.

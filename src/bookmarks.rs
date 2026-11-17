@@ -138,7 +138,7 @@ fn single_line(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, contents)?;
     fs::rename(&temporary, path)

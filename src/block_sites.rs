@@ -1,5 +1,5 @@
-//! The window for blocking the sites of entries selected in the Cookies and
-//! Site Data window, which suggests rules for them to change if need be, and
+//! The window for blocking the sites of entries selected in the Site Data
+//! Manager, which suggests rules for them to change if need be, and
 //! adds them to the end of the user's own rules.
 
 use std::collections::HashSet;

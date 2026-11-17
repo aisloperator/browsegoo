@@ -14,6 +14,7 @@ mod find_bar;
 mod location;
 mod location_bar;
 mod preferences;
+mod preserved;
 mod site_data;
 mod user_filters;
 
