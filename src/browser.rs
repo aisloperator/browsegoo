@@ -28,7 +28,7 @@ use crate::closing;
 use crate::decorations;
 use crate::filter::BlockedSites;
 use crate::find_bar::FindBar;
-use crate::filter_lists::{self, LISTS, ListStatus};
+use crate::filter_lists::{self, FilterList, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::local_network::{self, LocalOrigin};
 use crate::location_bar::LocationBar;
@@ -377,6 +377,9 @@ struct Browser {
     /// The tab whose page was last searched with the find bar.
     find_tab: Cell<Option<TabId>>,
     updating_lists: Cell<bool>,
+    /// Whether lists are being downloaded, and what the preferences say
+    /// about it, for when they're opened.
+    list_download_state: RefCell<(bool, String)>,
     /// The page to load once the filters are first ready, so that it's filtered.
     start_page: RefCell<Option<(TabId, Url)>>,
     preferences: RefCell<Option<PreferencesWindow>>,
@@ -501,6 +504,7 @@ fn open_window(
         blocked_deleting: Cell::new(false),
         find_tab: Cell::new(None),
         updating_lists: Cell::new(false),
+        list_download_state: RefCell::new((false, String::new())),
         start_page: RefCell::new(None),
         preferences: RefCell::new(None),
         bookmarks_editor: RefCell::new(None),
@@ -521,6 +525,7 @@ fn open_window(
         browser.start_page.replace(Some((tab.id, start_url)));
     }
     browser.reload_filters();
+    browser.download_missing_lists();
     browser.compile_local_filter(None);
 
     browser.widgets.window.present();
@@ -2021,6 +2026,8 @@ impl Browser {
                 }
             });
             preferences.show_statuses(&self.list_statuses.borrow());
+            let (updating, message) = &*self.list_download_state.borrow();
+            preferences.show_update_state(*updating, message);
             self.preferences.replace(Some(preferences));
         }
         if let Some(preferences) = self.preferences.borrow().as_ref() {
@@ -2031,19 +2038,49 @@ impl Browser {
     /// Downloads the enabled lists, in the background.
     fn update_lists(&self) {
         let lists = self.filter_settings.borrow().enabled_lists();
-        let show = |updating, message: &str| {
-            if let Some(preferences) = self.preferences.borrow().as_ref() {
-                preferences.show_update_state(updating, message);
-            }
-        };
         if lists.is_empty() {
-            show(false, "No lists are enabled.");
+            if let Some(preferences) = self.preferences.borrow().as_ref() {
+                preferences.show_update_state(false, "No lists are enabled.");
+            }
             return;
         }
+        self.download_lists(lists, "Updating\u{2026}", "Updated", "update");
+    }
+
+    /// Downloads the enabled lists that have never been downloaded, such as
+    /// when BrowseGoo is first run, in the background. Lists that have been
+    /// downloaded are left as they are, until Update Lists is pressed.
+    fn download_missing_lists(&self) {
+        let cache_dir = &self.dirs.cache;
+        let lists: Vec<&'static FilterList> = self
+            .filter_settings
+            .borrow()
+            .enabled_lists()
+            .into_iter()
+            .filter(|list| !filter_lists::cache_path(cache_dir, list).exists())
+            .collect();
+        if !lists.is_empty() {
+            self.download_lists(lists, "Downloading\u{2026}", "Downloaded", "download");
+        }
+    }
+
+    /// Downloads `lists` in the background, saying so in the preferences with
+    /// `doing`, `done` and `verb`, and then uses them.
+    fn download_lists(
+        &self,
+        lists: Vec<&'static FilterList>,
+        doing: &'static str,
+        done: &'static str,
+        verb: &'static str,
+    ) {
         if self.updating_lists.replace(true) {
             return;
         }
-        show(true, "Updating\u{2026}");
+        self.list_download_state
+            .replace((true, doing.to_owned()));
+        if let Some(preferences) = self.preferences.borrow().as_ref() {
+            preferences.show_update_state(true, doing);
+        }
 
         let cache_dir = self.dirs.cache.clone();
         let user_agent = user_agent();
@@ -2065,7 +2102,7 @@ impl Browser {
             };
             browser.updating_lists.set(false);
             let message = match results {
-                Err(_) => "Updating failed.".to_owned(),
+                Err(_) => format!("Could not {verb} the lists."),
                 Ok(results) => {
                     let failures: Vec<String> = results
                         .iter()
@@ -2073,19 +2110,23 @@ impl Browser {
                             result
                                 .as_ref()
                                 .err()
-                                .map(|error| format!("Could not update {name}: {error}."))
+                                .map(|error| format!("Could not {verb} {name}: {error}."))
                         })
                         .collect();
                     if failures.is_empty() {
                         match results.len() {
-                            1 => "Updated 1 list.".to_owned(),
-                            count => format!("Updated {count} lists."),
+                            1 => format!("{done} 1 list."),
+                            count => format!("{done} {count} lists."),
                         }
                     } else {
+                        for failure in &failures {
+                            eprintln!("{failure}");
+                        }
                         failures.join("\n")
                     }
                 }
             };
+            browser.list_download_state.replace((false, message.clone()));
             if let Some(preferences) = browser.preferences.borrow().as_ref() {
                 preferences.show_update_state(false, &message);
             }

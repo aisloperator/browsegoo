@@ -86,8 +86,10 @@ impl PreferencesWindow {
             .build();
         let intro = gtk::Label::builder()
             .label(
-                "Requests that the enabled lists match are blocked. Lists are only \
-                 downloaded when you press Update Lists.",
+                "Requests that the enabled lists match are blocked. Enabled lists \
+                 that haven't been downloaded yet are downloaded when BrowseGoo \
+                 starts. Otherwise, lists are only downloaded when you press \
+                 Update Lists.",
             )
             .xalign(0.0)
             .wrap(true)

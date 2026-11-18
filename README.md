@@ -144,8 +144,12 @@ page is still on the password's domain when filling it in.
 
 Which filter lists are enabled is in `~/.config/browsegoo/filter_lists.tsv`, and
 the downloaded lists are in `~/.cache/browsegoo/`, with WebKit's compiled
-versions in `compiled/` there. Lists are only downloaded with the Update Lists
-button in the preferences, so filtering does nothing until then. Compiling the
+versions in `compiled/` there. Enabled lists that haven't been downloaded yet,
+such as on the first run, are downloaded when BrowseGoo starts, in the
+background, so pages loaded before they're ready aren't filtered. Otherwise, lists are only downloaded with the Update Lists button in
+the preferences, so lists that have been downloaded aren't checked for updates
+until then. A list that's enabled later is downloaded the next time BrowseGoo
+starts, or with Update Lists. Compiling the
 four lists offered took about 15 seconds, and is only done again when a list
 changes. The compiled lists are large: about 90 MB for all four.
 
