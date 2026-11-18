@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=BrowseGoo
-Comment=A barebones Web browser built around WebKit
+Comment=Web browser
 Exec=browsegoo %u
 Icon=web-browser
 Terminal=false

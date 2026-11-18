@@ -1,4 +1,4 @@
-//! BrowseGoo: a barebones Web browser built around the WebKit engine, using GTK4.
+//! BrowseGoo: a Web browser.
 
 mod block_sites;
 mod bookmarks;

@@ -36,9 +36,8 @@ Architecture: ${arch}
 Maintainer: AI Sloperator <noreply@aisloperator.com>
 Homepage: https://www.aisloperator.com/
 Depends: ${libraries}, ${FONTS}
-Description: Barebones Web browser built around WebKit, using GTK4
- BrowseGoo is a barebones Web browser, assembled around the WebKit engine,
- with a GTK4 interface. Created by AI Sloperator with Claude Code.
+Description: Web browser
+ Created by AI Sloperator with Claude Code.
  Portions Copyright. No license is given.
 CONTROL
 

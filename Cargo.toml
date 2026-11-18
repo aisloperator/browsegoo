@@ -3,7 +3,7 @@ name = "browsegoo"
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A barebones Web browser built around the WebKit engine, using GTK4."
+description = "Web browser"
 homepage = "https://www.aisloperator.com/"
 publish = false
 
