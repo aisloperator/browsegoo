@@ -509,6 +509,14 @@ impl SiteDataWindow {
             .child(&content)
             .build();
         closing::add_close_keys(&window);
+        // The filter field takes Escape for itself, as stopping its search,
+        // which closes the window as Escape does elsewhere in it.
+        let to_close = window.downgrade();
+        search.connect_stop_search(move |_| {
+            if let Some(window) = to_close.upgrade() {
+                window.close();
+            }
+        });
         let close = closing::close_button(&window);
         bottom.append(&close);
 
