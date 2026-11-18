@@ -77,6 +77,9 @@ struct Entry {
     /// More about the entry, as labels and text, for when it's selected.
     details: Vec<(&'static str, String)>,
     source: Source,
+    /// The list's labels that show the entry, and what each shows, so that
+    /// they can be changed along with it.
+    labels: Vec<(glib::WeakRef<gtk::Label>, fn(&Entry) -> String)>,
 }
 
 impl Entry {
@@ -116,6 +119,7 @@ impl Entry {
             value,
             details,
             source: Source::Cookie(cookie),
+            labels: Vec::new(),
         }
     }
 
@@ -143,6 +147,7 @@ impl Entry {
                     value,
                     details,
                     source: Source::Stored(data.clone(), kind),
+                    labels: Vec::new(),
                 }
             })
             .collect()
@@ -158,6 +163,12 @@ impl Entry {
         format!("{}\t{}\t{}\t{path}", self.host, self.kind, self.name)
     }
 
+    /// Everything the window shows about the entry, to tell whether that has
+    /// changed from one listing to the next.
+    fn shown(&self) -> String {
+        format!("{}\0{:?}", self.value, self.details)
+    }
+
     /// The value for the list, which leaves out long ones.
     fn listed_value(&self) -> String {
         listed_value(&self.value)
@@ -169,6 +180,74 @@ impl Entry {
         let field = if by_name { &self.name } else { &self.host };
         field.to_lowercase().contains(filter)
     }
+}
+
+/// Rows to add or remove: replacing `removed` rows at `position` with the
+/// new listing's rows in `added`.
+#[derive(Debug, PartialEq)]
+struct Splice {
+    position: u32,
+    removed: u32,
+    added: std::ops::Range<usize>,
+}
+
+/// How to turn the old rows into the new ones.
+#[derive(Debug, Default, PartialEq)]
+struct Changes {
+    /// Rows that are still there but show something else, as their old
+    /// position and their place in the new listing. These are changed first.
+    changed: Vec<(u32, usize)>,
+    /// Then these are made in turn.
+    spliced: Vec<Splice>,
+}
+
+/// How to turn the `old` rows into the `new` ones, both given in order as
+/// their keys and what's shown of them, keeping the rows that are still there.
+fn changes_between(old: &[(String, String)], new: &[(String, String)]) -> Changes {
+    let old_keys: HashSet<&str> = old.iter().map(|(key, _)| key.as_str()).collect();
+    let new_keys: HashSet<&str> = new.iter().map(|(key, _)| key.as_str()).collect();
+    let mut changes = Changes::default();
+    let mut current: Option<Splice> = None;
+    // Where the next row goes, in the list as it is once the splices so far
+    // are made.
+    let mut position = 0;
+    let (mut i, mut j) = (0, 0);
+    loop {
+        let (removed, added) = if i < old.len() && !new_keys.contains(old[i].0.as_str()) {
+            (1, 0)
+        } else if j < new.len() && !old_keys.contains(new[j].0.as_str()) {
+            (0, 1)
+        } else if i < old.len() && j < new.len() && old[i].0 == new[j].0 {
+            if old[i].1 != new[j].1 {
+                changes.changed.push((i as u32, j));
+            }
+            if let Some(splice) = current.take() {
+                position += splice.added.len() as u32;
+                changes.spliced.push(splice);
+            }
+            position += 1;
+            i += 1;
+            j += 1;
+            continue;
+        } else if i < old.len() || j < new.len() {
+            // Rows moved, which the listing's order shouldn't do, so the
+            // rest is just replaced.
+            (old.len() - i, new.len() - j)
+        } else {
+            break;
+        };
+        let splice = current.get_or_insert(Splice {
+            position,
+            removed: 0,
+            added: j..j,
+        });
+        splice.removed += removed as u32;
+        splice.added.end += added;
+        i += removed;
+        j += added;
+    }
+    changes.spliced.extend(current);
+    changes
 }
 
 fn listed_value(value: &str) -> String {
@@ -221,6 +300,23 @@ fn format_time(time: &glib::DateTime) -> String {
         .unwrap_or_default()
 }
 
+/// Changes the entry that `object` holds to `entry`, and the labels that show it.
+fn change_entry(object: &glib::Object, mut entry: Entry) {
+    let mut held = entry_mut(object);
+    entry.labels = std::mem::take(&mut held.labels);
+    *held = entry;
+    for (label, text) in &held.labels {
+        if let Some(label) = label.upgrade() {
+            show_text(&label, &text(&held));
+        }
+    }
+}
+
+fn show_text(label: &gtk::Label, text: &str) {
+    label.set_tooltip_text((!text.is_empty()).then_some(text));
+    label.set_text(text);
+}
+
 /// The entry that a list item holds.
 fn entry_of(object: &glib::Object) -> std::cell::Ref<'_, Entry> {
     object
@@ -229,9 +325,17 @@ fn entry_of(object: &glib::Object) -> std::cell::Ref<'_, Entry> {
         .borrow::<Entry>()
 }
 
+fn entry_mut(object: &glib::Object) -> std::cell::RefMut<'_, Entry> {
+    object
+        .downcast_ref::<glib::BoxedAnyObject>()
+        .expect("the list holds entries")
+        .borrow_mut::<Entry>()
+}
+
 pub struct SiteDataWindow {
     window: gtk::Window,
     store: gio::ListStore,
+    columns: gtk::ColumnView,
     selection: gtk::MultiSelection,
     search: gtk::SearchEntry,
     details: gtk::Grid,
@@ -408,6 +512,7 @@ impl SiteDataWindow {
         let this = Rc::new(Self {
             window,
             store,
+            columns: columns.clone(),
             selection,
             search,
             details,
@@ -566,9 +671,43 @@ impl SiteDataWindow {
             .iter()
             .map(|object| entry_of(object).key())
             .collect();
-        let objects: Vec<glib::BoxedAnyObject> =
-            entries.into_iter().map(glib::BoxedAnyObject::new).collect();
-        self.store.splice(0, self.store.n_items(), &objects);
+        // The rows that are still there are kept, changed if need be, rather
+        // than replaced, so that the list stays scrolled to the same rows and
+        // they keep the keyboard focus. GTK scrolls to the top when the row
+        // with the focus is removed.
+        let old: Vec<(String, String)> = (0..self.store.n_items())
+            .filter_map(|position| self.store.item(position))
+            .map(|object| {
+                let entry = entry_of(&object);
+                (entry.key(), entry.shown())
+            })
+            .collect();
+        let new: Vec<(String, String)> = entries
+            .iter()
+            .map(|entry| (entry.key(), entry.shown()))
+            .collect();
+        let changes = changes_between(&old, &new);
+        let mut entries: Vec<Option<Entry>> = entries.into_iter().map(Some).collect();
+        for &(position, index) in &changes.changed {
+            if let (Some(object), Some(entry)) = (self.store.item(position), entries[index].take())
+            {
+                change_entry(&object, entry);
+            }
+        }
+        for splice in changes.spliced {
+            let added: Vec<glib::BoxedAnyObject> = entries[splice.added]
+                .iter_mut()
+                .filter_map(Option::take)
+                .map(glib::BoxedAnyObject::new)
+                .collect();
+            self.store.splice(splice.position, splice.removed, &added);
+        }
+        // A column the list is sorted by might have changed.
+        if !changes.changed.is_empty() {
+            if let Some(sorter) = self.columns.sorter() {
+                sorter.changed(gtk::SorterChange::Different);
+            }
+        }
 
         if !selected.is_empty() {
             let keep = gtk::Bitset::new_empty();
@@ -886,9 +1025,19 @@ fn add_column(
         };
         if let (Some(object), Some(label)) = (item.item(), item.child().and_downcast::<gtk::Label>())
         {
-            let text = text(&entry_of(&object));
-            label.set_tooltip_text((!text.is_empty()).then_some(text.as_str()));
-            label.set_text(&text);
+            show_text(&label, &text(&entry_of(&object)));
+            entry_mut(&object).labels.push((label.downgrade(), text));
+        }
+    });
+    factory.connect_unbind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        if let (Some(object), Some(label)) = (item.item(), item.child().and_downcast::<gtk::Label>())
+        {
+            entry_mut(&object)
+                .labels
+                .retain(|(bound, _)| bound.upgrade().is_some_and(|bound| bound != label));
         }
     });
     let sorter = gtk::CustomSorter::new(move |a, b| {
@@ -945,6 +1094,79 @@ mod tests {
         assert_eq!(format_size(1023), "1023 bytes");
         assert_eq!(format_size(1536), "1.5 KB");
         assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    fn rows(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|(key, shown)| (key.to_string(), shown.to_string()))
+            .collect()
+    }
+
+    /// The rows after making `changes` to `old`.
+    fn changed(
+        old: &[(String, String)],
+        new: &[(String, String)],
+        changes: Changes,
+    ) -> Vec<(String, String)> {
+        let mut list = old.to_vec();
+        for (position, index) in changes.changed {
+            list[position as usize] = new[index].clone();
+        }
+        for splice in changes.spliced {
+            let position = splice.position as usize;
+            list.splice(
+                position..position + splice.removed as usize,
+                new[splice.added].iter().cloned(),
+            );
+        }
+        list
+    }
+
+    #[test]
+    fn rows_that_are_still_there_are_kept() {
+        let old = rows(&[("a", "1"), ("b", "1"), ("c", "1"), ("d", "1"), ("e", "1")]);
+        // Nothing changed.
+        assert_eq!(changes_between(&old, &old), Changes::default());
+        // From nothing, and to nothing.
+        assert_eq!(
+            changes_between(&[], &old).spliced,
+            [Splice { position: 0, removed: 0, added: 0..5 }]
+        );
+        assert_eq!(
+            changes_between(&old, &[]).spliced,
+            [Splice { position: 0, removed: 5, added: 0..0 }]
+        );
+        // "a" is removed, "c" changes, "cc" is added, and "f" is added.
+        let new = rows(&[("b", "1"), ("c", "2"), ("cc", "1"), ("d", "1"), ("e", "1"), ("f", "1")]);
+        let changes = changes_between(&old, &new);
+        assert_eq!(
+            changes,
+            Changes {
+                changed: vec![(2, 1)],
+                spliced: vec![
+                    Splice { position: 0, removed: 1, added: 0..0 },
+                    Splice { position: 2, removed: 0, added: 2..3 },
+                    Splice { position: 5, removed: 0, added: 5..6 },
+                ],
+            }
+        );
+        assert_eq!(changed(&old, &new, changes), new);
+    }
+
+    #[test]
+    fn rows_that_moved_are_replaced() {
+        let old = rows(&[("a", "1"), ("b", "1"), ("c", "1")]);
+        let new = rows(&[("a", "1"), ("c", "1"), ("b", "1")]);
+        let changes = changes_between(&old, &new);
+        assert_eq!(changes.spliced, [Splice { position: 1, removed: 2, added: 1..3 }]);
+        assert_eq!(changed(&old, &new, changes), new);
+    }
+
+    #[test]
+    fn changes_give_the_new_rows() {
+        let old = rows(&[("a", "1"), ("b", "1"), ("c", "1"), ("d", "1")]);
+        let new = rows(&[("0", "1"), ("b", "2"), ("bb", "1"), ("d", "1"), ("e", "1")]);
+        assert_eq!(changed(&old, &new, changes_between(&old, &new)), new);
     }
 
     #[test]
