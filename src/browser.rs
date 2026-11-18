@@ -26,6 +26,7 @@ use crate::bookmarks_editor::{BookmarksEditor, Edit};
 use crate::block_sites;
 use crate::closing;
 use crate::decorations;
+use crate::filter::BlockedSites;
 use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
@@ -50,6 +51,13 @@ const NEW_TAB_TITLE: &str = "New Tab";
 /// How long quitting waits for the site data that isn't preserved to be
 /// deleted. What's left is deleted the next time BrowseGoo starts.
 const DELETING_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long to wait after cookies change, or a page loads, before deleting
+/// what blocked sites stored, as pages often store several things at once.
+const DELETING_BLOCKED_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long after a page loads to look again for what blocked sites stored.
+const DELETING_BLOCKED_AGAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long what the user asked a tab to load counts as asked for, if WebKit
 /// hasn't asked whether to go there by then. It can take a while, when a web
@@ -358,6 +366,14 @@ struct Browser {
     list_statuses: RefCell<BTreeMap<&'static str, ListStatus>>,
     /// Counts filter reloads, so that only the newest one is used.
     filter_generation: Cell<u64>,
+    /// The sites that the filter lists in use block entirely, whose cookies
+    /// and site data are deleted.
+    blocked_sites: RefCell<Rc<BlockedSites>>,
+    /// Whether deleting what blocked sites stored is waiting to start, and
+    /// whether that includes data other than cookies.
+    blocked_deleting_scheduled: Cell<Option<bool>>,
+    /// Whether it's being deleted.
+    blocked_deleting: Cell<bool>,
     /// The tab whose page was last searched with the find bar.
     find_tab: Cell<Option<TabId>>,
     updating_lists: Cell<bool>,
@@ -480,6 +496,9 @@ fn open_window(
         filter_settings: RefCell::new(filter_settings),
         list_statuses: RefCell::new(BTreeMap::new()),
         filter_generation: Cell::new(0),
+        blocked_sites: RefCell::new(Rc::new(BlockedSites::default())),
+        blocked_deleting_scheduled: Cell::new(None),
+        blocked_deleting: Cell::new(false),
         find_tab: Cell::new(None),
         updating_lists: Cell::new(false),
         start_page: RefCell::new(None),
@@ -837,6 +856,17 @@ impl Browser {
                     let url = tab.webview.uri().and_then(|url| Url::parse(&url).ok());
                     tab.committed.replace(url);
                 }
+                // WebKit doesn't say when site data other than cookies
+                // changes, so it's looked at as pages load, and again a
+                // little later, as the HTTP cache is written afterwards.
+                webkit::LoadEvent::Finished => {
+                    browser.delete_blocked_soon(true);
+                    glib::timeout_add_local_once(DELETING_BLOCKED_AGAIN, || {
+                        if let Some(browser) = current_browser() {
+                            browser.delete_blocked_soon(true);
+                        }
+                    });
+                }
                 _ => {}
             }
         });
@@ -1139,6 +1169,14 @@ impl Browser {
 
     fn connect_widgets(self: &Rc<Self>) {
         let widgets = &self.widgets;
+
+        if let Some(cookies) = self.network_session.cookie_manager() {
+            cookies.connect_changed(|_| {
+                if let Some(browser) = current_browser() {
+                    browser.delete_blocked_soon(false);
+                }
+            });
+        }
 
         let find_bar = &widgets.find_bar;
         let with_browser = |action: fn(&Browser)| {
@@ -1449,6 +1487,57 @@ impl Browser {
         });
     }
 
+    /// Deletes the cookies that blocked sites stored, shortly, and with
+    /// `data`, the sites' other data, unless they're preserved.
+    fn delete_blocked_soon(&self, data: bool) {
+        let scheduled = self.blocked_deleting_scheduled.get();
+        self.blocked_deleting_scheduled
+            .set(Some(data || scheduled == Some(true)));
+        if scheduled.is_some() {
+            return;
+        }
+        glib::timeout_add_local_once(DELETING_BLOCKED_DELAY, || {
+            if let Some(browser) = current_browser() {
+                browser.delete_blocked();
+            }
+        });
+    }
+
+    fn delete_blocked(&self) {
+        if self.quitting.get() {
+            return;
+        }
+        // Deleting cookies changes them, which schedules this again, to wait
+        // for until this is done.
+        if self.blocked_deleting.get() {
+            glib::timeout_add_local_once(DELETING_BLOCKED_DELAY, || {
+                if let Some(browser) = current_browser() {
+                    browser.delete_blocked();
+                }
+            });
+            return;
+        }
+        let Some(data) = self.blocked_deleting_scheduled.take() else {
+            return;
+        };
+        let (Some(cookies), Some(manager)) = (
+            self.network_session.cookie_manager(),
+            self.network_session.website_data_manager(),
+        ) else {
+            return;
+        };
+        self.blocked_deleting.set(true);
+        let preserved = self.preserved.clone();
+        let blocked = self.blocked_sites.borrow().clone();
+        glib::spawn_future_local(async move {
+            let manager = data.then_some(&manager);
+            site_data::delete_blocked(&cookies, manager, &preserved, &blocked).await;
+            if let Some(browser) = current_browser() {
+                browser.blocked_deleting.set(false);
+            }
+        });
+    }
+
     fn show_site_data(&self) {
         if self.site_data.borrow().is_none() {
             let (Some(cookies), Some(data)) = (
@@ -1690,7 +1779,7 @@ impl Browser {
                 filter_lists::convert_lists(&directory, &config_dir, &enabled)
             })
             .await;
-            let Ok((converted, mut statuses)) = converted else {
+            let Ok((converted, mut statuses, blocked)) = converted else {
                 if let Some(browser) = current_browser() {
                     browser.filters_loaded.set(true);
                     browser.load_start_page();
@@ -1748,6 +1837,8 @@ impl Browser {
             for tab in browser.tabs.borrow().iter() {
                 browser.apply_filters(tab);
             }
+            browser.blocked_sites.replace(Rc::new(blocked));
+            browser.delete_blocked_soon(true);
             browser.show_list_statuses(statuses);
             browser.update_filter_button();
             browser.filters_loaded.set(true);

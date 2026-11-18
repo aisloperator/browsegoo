@@ -6,7 +6,9 @@
 //! kind for a site, so each of those is one row.
 //!
 //! What isn't preserved is deleted by `delete_unpreserved`, when BrowseGoo
-//! quits and when it starts, and with the window's Clean Up button.
+//! quits and when it starts, and with the window's Clean Up button. What's
+//! from sites that the filter rules block is deleted by `delete_blocked` as
+//! it's stored, unless it's preserved.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -20,6 +22,7 @@ use webkit::soup;
 
 use crate::block_sites;
 use crate::closing;
+use crate::filter::BlockedSites;
 use crate::preserved::Preserved;
 
 /// Longer values are only shown below the list, when their row is selected.
@@ -803,7 +806,8 @@ impl SiteDataWindow {
     }
 
     /// Opens a window with rules for blocking the selected entries' sites,
-    /// which leaves them selected, to delete next if need be.
+    /// which leaves them selected. What their sites stored is deleted once the
+    /// rules are applied, unless it's preserved.
     fn block_selected(self: &Rc<Self>) {
         let selected = self.selected();
         if selected.is_empty() {
@@ -889,11 +893,38 @@ pub async fn delete_unpreserved(
     data: &webkit::WebsiteDataManager,
     preserved: &RefCell<Preserved>,
 ) {
-    let is_preserved = |entry: &Entry| preserved.borrow().contains(&entry.key());
+    let unpreserved = |entry: &Entry| !preserved.borrow().contains(&entry.key());
+    delete_where(cookies, Some(data), unpreserved).await;
+}
+
+/// Deletes the cookies of sites that the filter rules block entirely, and
+/// with `data`, the sites' other data, except what's preserved. Pages that
+/// aren't filtered can store them, and they could be stored before the rules
+/// blocked their sites.
+pub async fn delete_blocked(
+    cookies: &webkit::CookieManager,
+    data: Option<&webkit::WebsiteDataManager>,
+    preserved: &RefCell<Preserved>,
+    blocked: &BlockedSites,
+) {
+    if blocked.is_empty() {
+        return;
+    }
+    let unwanted =
+        |entry: &Entry| blocked.blocks(&entry.host) && !preserved.borrow().contains(&entry.key());
+    delete_where(cookies, data, unwanted).await;
+}
+
+/// Deletes the cookies, and with `data` the other site data, that `unwanted` says to.
+async fn delete_where(
+    cookies: &webkit::CookieManager,
+    data: Option<&webkit::WebsiteDataManager>,
+    unwanted: impl Fn(&Entry) -> bool,
+) {
     match cookies.all_cookies_future().await {
         Ok(all) => {
             for entry in all.into_iter().map(Entry::from_cookie) {
-                if let (false, Source::Cookie(cookie)) = (is_preserved(&entry), &entry.source) {
+                if let (true, Source::Cookie(cookie)) = (unwanted(&entry), &entry.source) {
                     if let Err(error) = cookies.delete_cookie_future(cookie).await {
                         eprintln!("Could not delete {}: {error}", entry.key());
                     }
@@ -902,12 +933,15 @@ pub async fn delete_unpreserved(
         }
         Err(error) => eprintln!("Could not list cookies to delete: {error}"),
     }
+    let Some(data) = data else {
+        return;
+    };
     match data.fetch_future(Types::ALL & !Types::COOKIES).await {
         Ok(stored) => {
             let entries: Vec<Entry> = stored
                 .iter()
                 .flat_map(Entry::from_stored)
-                .filter(|entry| !is_preserved(entry))
+                .filter(|entry| unwanted(entry))
                 .collect();
             // One request for each kind, for all the sites that have it.
             for (kind, kind_name) in STORED_KINDS {

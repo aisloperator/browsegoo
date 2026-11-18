@@ -12,6 +12,8 @@
 //! `$important` blocking rules, which exceptions don't undo, and last the
 //! exceptions that turn filtering off on whole pages.
 
+use std::collections::HashSet;
+
 /// The kinds of resource that filter rules can be limited to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResourceType {
@@ -198,6 +200,123 @@ pub fn lines_not_applied(text: &str) -> Vec<usize> {
         .filter(|(_, line)| matches!(convert_line(line), Line::NotNetwork | Line::Unsupported))
         .map(|(index, _)| index + 1)
         .collect()
+}
+
+/// The sites that filter lists block entirely: everything from the site and
+/// its subdomains, wherever it's from, so that nothing they store is wanted.
+///
+/// That's a rule that's just a host name, such as `||tracker.example^`, with
+/// no options that limit it, unless an exception might let something from
+/// the site through, which `$important` rules ignore. Exceptions for parts
+/// of sites count, but not those for any site, such as `@@/ads.js`, which
+/// are for particular files. Exceptions that turn off filtering on whole
+/// pages don't count either.
+#[derive(Debug, Default)]
+pub struct BlockedSites {
+    /// WebKit applies each list on its own, so an exception in one doesn't
+    /// stop another from blocking.
+    lists: Vec<ListSites>,
+}
+
+#[derive(Debug, Default)]
+struct ListSites {
+    blocked: HashSet<String>,
+    important: HashSet<String>,
+    /// The hosts that exceptions are for.
+    excepted: HashSet<String>,
+    /// The domains that those hosts are in, whose data they're sent to.
+    excepted_within: HashSet<String>,
+}
+
+impl BlockedSites {
+    /// Adds the sites that a list blocks.
+    pub fn add_list(&mut self, text: &str) {
+        let mut sites = ListSites::default();
+        for line in text.lines() {
+            let (kind, Some(rule)) = parse_line(line) else {
+                continue;
+            };
+            match kind {
+                Parsed::Block => {
+                    let unlimited = rule.anchor == Anchor::Host
+                        && is_host_only(&rule.body)
+                        && rule.third_party.is_none()
+                        && rule.include_domains.is_empty()
+                        && rule.exclude_domains.is_empty()
+                        && rule.types & DEFAULT_TYPES == DEFAULT_TYPES;
+                    if unlimited {
+                        let host = rule.body.strip_suffix(b"^").unwrap_or(&rule.body);
+                        let host = String::from_utf8_lossy(host).into_owned();
+                        if rule.important {
+                            sites.important.insert(host);
+                        } else {
+                            sites.blocked.insert(host);
+                        }
+                    }
+                }
+                Parsed::Exception => {
+                    if let Some(host) = exception_host(&rule) {
+                        let mut domain = host.as_str();
+                        while let Some((_, parent)) = domain.split_once('.') {
+                            sites.excepted_within.insert(parent.to_owned());
+                            domain = parent;
+                        }
+                        sites.excepted.insert(host);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !sites.blocked.is_empty() || !sites.important.is_empty() {
+            self.lists.push(sites);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lists.is_empty()
+    }
+
+    /// Whether everything from `host` is blocked. A leading dot, as in a
+    /// cookie's domain, is ignored.
+    pub fn blocks(&self, host: &str) -> bool {
+        let host = host.trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        // The host and the domains it's in.
+        let mut domains = vec![host.as_str()];
+        while let Some((_, parent)) = domains[domains.len() - 1].split_once('.') {
+            domains.push(parent);
+        }
+        self.lists.iter().any(|sites| {
+            let any_in = |set: &HashSet<String>| domains.iter().any(|domain| set.contains(*domain));
+            any_in(&sites.important)
+                || (any_in(&sites.blocked)
+                    && !any_in(&sites.excepted)
+                    && !sites.excepted_within.contains(&host))
+        })
+    }
+}
+
+/// The host that an exception is for, or `None` if it's for any host.
+fn exception_host(rule: &Rule) -> Option<String> {
+    let body = match rule.anchor {
+        Anchor::Host => rule.body.as_slice(),
+        Anchor::Start => {
+            let text = std::str::from_utf8(&rule.body).ok()?;
+            text.split_once("://")?.1.as_bytes()
+        }
+        Anchor::None => return None,
+    };
+    let length = body
+        .iter()
+        .position(|&c| !(c.is_ascii_alphanumeric() || c == b'.' || c == b'-'))
+        .unwrap_or(body.len());
+    let host = String::from_utf8_lossy(&body[..length]).to_ascii_lowercase();
+    let host = host.trim_matches('.');
+    // A host cut short by a wildcard, such as `||ads*.example`, could be any.
+    let cut_short = body.get(length) == Some(&b'*');
+    (!host.is_empty() && !cut_short).then(|| host.to_owned())
 }
 
 /// The triggers for a rule about requests, or `None` if WebKit can't express it.
@@ -673,6 +792,86 @@ mod tests {
     fn lines_not_applied_include_element_hiding() {
         let text = "! A comment\n\n||ads.example^\nexample.com##.ad\n/a[0-9]/\n||ok.example^$image";
         assert_eq!(lines_not_applied(text), [4, 5]);
+    }
+
+    fn blocked(lists: &[&str]) -> BlockedSites {
+        let mut sites = BlockedSites::default();
+        for list in lists {
+            sites.add_list(list);
+        }
+        sites
+    }
+
+    #[test]
+    fn sites_blocked_entirely() {
+        let sites = blocked(&["||tracker.example^\n||ads.site.example^\n||cdn.example\n||all.example^$all"]);
+        for host in [
+            "tracker.example",
+            ".tracker.example",
+            "a.b.tracker.example",
+            "Tracker.Example",
+            "ads.site.example",
+            "x.ads.site.example",
+            "cdn.example",
+            "all.example",
+        ] {
+            assert!(sites.blocks(host), "{host}");
+        }
+        // Only a subdomain of it is blocked, or a different site.
+        for host in ["site.example", ".site.example", "example", "tracker.example.org", "xtracker.example", ""] {
+            assert!(!sites.blocks(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn rules_that_are_limited_dont_block_sites() {
+        let sites = blocked(&[
+            "||a.example^$third-party\n||b.example^$script\n||c.example^$domain=x.example\n\
+             ||d.example^$domain=~x.example\n||e.example/ads^\n/f.example/\n|https://g.example/\n\
+             ||h.example^$document\n||i.example^$~image",
+        ]);
+        for host in [
+            "a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example",
+            "h.example", "i.example",
+        ] {
+            assert!(!sites.blocks(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn exceptions_unblock_sites_except_for_important_rules() {
+        let sites = blocked(&[
+            "||a.example^\n@@||a.example/ok.js\n\
+             ||b.example^\n@@||cdn.b.example^$script\n\
+             ||c.example^$important\n@@||c.example^\n\
+             ||d.example^\n@@|https://www.d.example/\n\
+             ||e.example^\n@@/ads.js\n@@*e.example\n@@||site.example^$document\n\
+             ||f.example^\n@@||sub*.f.example^",
+        ]);
+        assert!(!sites.blocks("a.example"));
+        assert!(!sites.blocks("x.a.example"));
+        // Its data is sent to the subdomain that's let through.
+        assert!(!sites.blocks("b.example"));
+        assert!(!sites.blocks("cdn.b.example"));
+        assert!(sites.blocks("ads.b.example"));
+        assert!(sites.blocks("c.example"));
+        assert!(!sites.blocks("d.example"));
+        assert!(!sites.blocks("www.d.example"));
+        assert!(sites.blocks("ads.d.example"));
+        // Exceptions for files on any site, or for whole pages.
+        assert!(sites.blocks("e.example"));
+        // A host cut short by a wildcard is ignored.
+        assert!(sites.blocks("f.example"));
+    }
+
+    #[test]
+    fn an_exception_in_one_list_doesnt_unblock_another() {
+        let sites = blocked(&["||a.example^\n||b.example^", "@@||a.example^\n||c.example^"]);
+        assert!(sites.blocks("a.example"));
+        assert!(sites.blocks("b.example"));
+        assert!(sites.blocks("c.example"));
+        let sites = blocked(&["||a.example^\n@@||a.example^"]);
+        assert!(!sites.blocks("a.example"));
     }
 
     #[test]

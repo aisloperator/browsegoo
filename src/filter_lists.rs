@@ -9,7 +9,7 @@ use std::{fs, io};
 use url::Url;
 
 use crate::fetch;
-use crate::filter::{self, ListStats};
+use crate::filter::{self, BlockedSites, ListStats};
 
 pub struct FilterList {
     /// Also the name of its file in the cache.
@@ -168,12 +168,18 @@ const CONVERSION_VERSION: u32 = 2;
 
 /// Converts the cached copies of the enabled lists, and the user's own rules,
 /// and reports on every list, and on the user's rules as `USER_RULES_ID`.
+/// Also gives the sites that they block entirely.
 pub fn convert_lists(
     cache_dir: &Path,
     config_dir: &Path,
     enabled: &[&FilterList],
-) -> (Vec<Converted>, BTreeMap<&'static str, ListStatus>) {
+) -> (
+    Vec<Converted>,
+    BTreeMap<&'static str, ListStatus>,
+    BlockedSites,
+) {
     let mut converted = Vec::new();
+    let mut blocked = BlockedSites::default();
     let mut statuses = BTreeMap::new();
     let user_rules = load_user_rules(config_dir);
     let user_exceptions = match &user_rules {
@@ -196,6 +202,7 @@ pub fn convert_lists(
                         text.push_str(&user_exceptions);
                     }
                     let (json, mut stats) = filter::convert_list(&text);
+                    blocked.add_list(&text);
                     // The list is counted without the user's exceptions.
                     stats.rules -= exception_stats.rules;
                     stats.unsupported -= exception_stats.unsupported;
@@ -217,6 +224,7 @@ pub fn convert_lists(
     match user_rules {
         Ok(text) => {
             let (json, stats) = filter::convert_list(&text);
+            blocked.add_list(&text);
             status.stats = Some(stats);
             // WebKit has no use for a list without rules.
             if stats.rules > 0 {
@@ -230,7 +238,7 @@ pub fn convert_lists(
         Err(error) => status.problem = Some(format!("Could not read them: {error}")),
     }
     statuses.insert(USER_RULES_ID, status);
-    (converted, statuses)
+    (converted, statuses, blocked)
 }
 
 /// A hash of a list and of how it's converted.
@@ -317,7 +325,10 @@ mod tests {
         .unwrap();
 
         let config = temporary_dir("no-user-rules");
-        let (converted, statuses) = convert_lists(&cache, &config, &[&LISTS[0], &LISTS[1]]);
+        let (converted, statuses, blocked) =
+            convert_lists(&cache, &config, &[&LISTS[0], &LISTS[1]]);
+        assert!(blocked.blocks("a.example"));
+        assert!(!blocked.blocks("c.example"));
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].id, "easylist");
         assert!(!is_compiled(&cache, &converted[0]));
@@ -339,7 +350,10 @@ mod tests {
         save_user_rules(&config, "! Mine\n||mine.example^\n@@||a.example^\n").unwrap();
         assert!(load_user_rules(&config).unwrap().contains("mine.example"));
 
-        let (converted, statuses) = convert_lists(&cache, &config, &[&LISTS[0]]);
+        let (converted, statuses, blocked) = convert_lists(&cache, &config, &[&LISTS[0]]);
+        assert!(blocked.blocks("mine.example"));
+        // The user's exception is in the list too.
+        assert!(!blocked.blocks("a.example"));
         let ids: Vec<_> = converted.iter().map(|converted| converted.id).collect();
         assert_eq!(ids, ["easylist", USER_RULES_ID]);
         assert_eq!(statuses[USER_RULES_ID].stats.map(|stats| stats.rules), Some(2));
@@ -348,7 +362,7 @@ mod tests {
         assert_eq!(statuses["easylist"].stats.map(|stats| stats.rules), Some(1));
 
         save_user_rules(&config, "! Only a comment\n").unwrap();
-        let (converted, _) = convert_lists(&cache, &config, &[&LISTS[0]]);
+        let (converted, _, _) = convert_lists(&cache, &config, &[&LISTS[0]]);
         assert_eq!(converted.len(), 1);
     }
 

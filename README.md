@@ -54,6 +54,14 @@ Portions Copyright.  No license is given.
   Manager. They're also deleted when it starts, before it loads anything, in
   case it didn't quit cleanly. If deleting takes more than 10 seconds when
   quitting, BrowseGoo quits anyway and deletes the rest the next time it starts.
+- Cookies and site data from sites that the filter rules block entirely are
+  deleted as they're stored, unless they're preserved. Those can still store
+  some, such as from a tab with filtering off, or before a rule blocked them.
+  A site is blocked entirely by a rule that's just its name, such as
+  `||tracker.example^`, with no options that limit it, such as `$third-party`,
+  unless an exception might let some of it through, which `$important` rules
+  ignore. Cookies are deleted within a second, and other data, which WebKit
+  doesn't say is stored, after pages load and when the rules change.
 - A Site Data Manager window, from the main menu, which lists each cookie,
   and each kind of other data that a site has stored, such as local storage or
   IndexedDB. A field above the list filters it by site, or by name, and
@@ -75,7 +83,7 @@ Portions Copyright.  No license is given.
   of the selected items, such as `||ads.example.com^$important`, which blocks
   everything from the site and its subdomains, even where there's an exception.
   They can be changed before Apply adds them to the end of your filter rules.
-  The items stay selected, to delete them too if wanted.
+  Then what the sites stored is deleted, unless it's preserved.
 - Saved passwords for sites. When a password is entered in a form, a key
   button appears after the location field, which asks whether to save it, with
   the username and the hidden password to change first if need be. Each one
