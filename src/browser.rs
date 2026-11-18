@@ -29,6 +29,7 @@ use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
+use crate::page_fonts;
 use crate::password_manager::PasswordManager;
 use crate::password_prompts::{self, PageMessage};
 use crate::passwords::{self, Passwords};
@@ -247,6 +248,8 @@ struct Browser {
     /// The cookies and site data that aren't deleted on quitting.
     preserved: Rc<RefCell<Preserved>>,
     passwords: Rc<RefCell<Passwords>>,
+    /// Whether the fonts that pages can use are limited.
+    page_fonts: page_fonts::State,
     /// Whether the site data is being deleted, before quitting.
     quitting: Cell<bool>,
     /// Where WebKit keeps the compiled filter lists.
@@ -271,9 +274,15 @@ struct Browser {
 
 /// Opens the browser window at `start_url`, once the cookies and site data
 /// that aren't preserved are deleted, in case BrowseGoo didn't quit cleanly.
-pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
+pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page_fonts::State) {
     if current_browser().is_some() {
         return;
+    }
+    // Before any web process starts, so that they can read the font settings.
+    if let (page_fonts::State::Limited { .. }, Some(context)) =
+        (&page_fonts, webkit::WebContext::default())
+    {
+        context.add_path_to_sandbox(page_fonts::config_dir(&dirs.cache), true);
     }
 
     let network_session = webkit::NetworkSession::new(
@@ -304,7 +313,7 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url) {
         ) {
             site_data::delete_unpreserved(&cookies, &data, &preserved).await;
         }
-        open_window(&app, dirs, start_url, network_session, preserved);
+        open_window(&app, dirs, start_url, network_session, preserved, page_fonts);
         drop(hold);
     });
 }
@@ -315,6 +324,7 @@ fn open_window(
     start_url: Url,
     network_session: webkit::NetworkSession,
     preserved: Rc<RefCell<Preserved>>,
+    page_fonts: page_fonts::State,
 ) {
     let settings = webkit::Settings::new();
     settings.set_user_agent(Some(&user_agent()));
@@ -349,6 +359,7 @@ fn open_window(
         bookmarks: RefCell::new(bookmarks),
         preserved,
         passwords: Rc::new(RefCell::new(passwords)),
+        page_fonts,
         quitting: Cell::new(false),
         filter_store,
         filters: RefCell::new(Vec::new()),
@@ -1604,8 +1615,22 @@ impl Browser {
 
     fn show_preferences(self: &Rc<Self>) {
         if self.preferences.borrow().is_none() {
-            let preferences =
-                PreferencesWindow::new(&self.widgets.window, &self.filter_settings.borrow());
+            let preferences = PreferencesWindow::new(
+                &self.widgets.window,
+                &self.filter_settings.borrow(),
+                page_fonts::is_chosen(&self.dirs.config),
+                self.page_fonts.note().as_deref(),
+            );
+            preferences.limit_fonts.connect_toggled(|check| {
+                let Some(browser) = current_browser() else {
+                    return;
+                };
+                let limited = check.is_active();
+                if let Err(error) = page_fonts::choose(&browser.dirs.config, limited) {
+                    eprintln!("Could not save the font setting: {error}");
+                    check.set_active(!limited);
+                }
+            });
             for row in &preferences.rows {
                 let id = row.id;
                 row.check.connect_toggled(move |check| {

@@ -1,4 +1,4 @@
-//! The preferences window, which for now is about filter lists.
+//! The preferences window, for the fonts that pages can use, and filter lists.
 
 use std::collections::BTreeMap;
 use std::time::UNIX_EPOCH;
@@ -20,10 +20,19 @@ pub struct PreferencesWindow {
     pub rows: Vec<ListRow>,
     pub update: gtk::Button,
     update_status: gtk::Label,
+    /// Whether to limit the fonts that pages can use, from the next start.
+    pub limit_fonts: gtk::CheckButton,
 }
 
 impl PreferencesWindow {
-    pub fn new(parent: &gtk::ApplicationWindow, settings: &Settings) -> Self {
+    /// `fonts_note` says why the fonts that pages can use aren't limited as
+    /// chosen, if they aren't.
+    pub fn new(
+        parent: &gtk::ApplicationWindow,
+        settings: &Settings,
+        limit_fonts: bool,
+        fonts_note: Option<&str>,
+    ) -> Self {
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
@@ -32,6 +41,43 @@ impl PreferencesWindow {
             .margin_start(18)
             .margin_end(18)
             .build();
+
+        let section = |text: &str| {
+            gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .css_classes(["title-4"])
+                .build()
+        };
+        let explain = |text: &str| {
+            gtk::Label::builder()
+                .label(text)
+                .xalign(0.0)
+                .wrap(true)
+                .margin_start(28)
+                .css_classes(["dim-label", "caption"])
+                .build()
+        };
+        content.append(&section("Fonts"));
+        let limit_fonts = gtk::CheckButton::builder()
+            .label("Limit the fonts that pages can use")
+            .active(limit_fonts)
+            .build();
+        content.append(&limit_fonts);
+        content.append(&explain(
+            "Pages can only use DejaVu, Liberation and Noto Color Emoji, and fonts \
+             they provide themselves, so that they can't tell which fonts are \
+             installed, which would help to tell you apart from other people. Text \
+             in other scripts, such as Chinese, Japanese, Korean or Thai, may not \
+             show unless the page provides a font for it. A change takes effect \
+             when BrowseGoo is started again.",
+        ));
+        if let Some(note) = fonts_note {
+            let note = explain(note);
+            note.remove_css_class("dim-label");
+            note.add_css_class("warning");
+            content.append(&note);
+        }
 
         let heading = gtk::Label::builder()
             .label("Filter Lists")
@@ -114,6 +160,7 @@ impl PreferencesWindow {
             rows,
             update,
             update_status,
+            limit_fonts,
         }
     }
 

@@ -154,6 +154,27 @@ exception for.
   own, so that they can't stop it or add one back in time for a click. Pages
   can see that the attributes are gone, and can still track clicks in other
   ways, such as with scripts, `navigator.sendBeacon()` or redirecting links.
+- The fonts that pages can use are limited to DejaVu, Liberation and Noto
+  Color Emoji, the fonts in the packages that BrowseGoo's `.deb` depends on,
+  and fonts that pages provide themselves. So pages can't tell which fonts are
+  installed, which is one of the best ways to tell people apart on Linux,
+  whether by measuring text, with CSS `local()` fonts, or by drawing text on a
+  canvas. Pages also don't get the desktop's font settings: they get the same
+  rendering, such as antialiasing and hinting, and the same fonts for
+  `sans-serif`, `serif` and `monospace`, for everyone. Pages that ask for Arial,
+  Helvetica, Times New Roman or Courier New get the Liberation font with the
+  same widths of text. BrowseGoo's own window keeps the desktop's fonts.
+  - Text in scripts that these fonts don't cover, such as Chinese, Japanese,
+    Korean, Indic scripts or Thai, shows as empty boxes on pages that don't
+    provide a font for it.
+  - This can be turned off in the preferences, from the next time BrowseGoo
+    starts. The choice is in `~/.config/browsegoo/page_fonts.txt`, and the
+    fontconfig file that pages get is written to
+    `~/.cache/browsegoo/page-fonts/fonts.conf` each time BrowseGoo starts.
+  - BrowseGoo users only look the same to pages if they have the same versions
+    of the fonts and the libraries that draw them, such as on the same Debian
+    release. Fonts aren't limited if DejaVu Sans isn't installed, and the
+    preferences say if any of the fonts are missing.
 
 ## Building
 
@@ -173,6 +194,14 @@ Then:
 
 The first release build took about 2 minutes on 2 CPU cores. WebKit itself is
 the system's shared library, so it isn't compiled.
+
+The fonts that pages are limited to are in these packages, which the `.deb`
+depends on, and which a build from source needs installed too:
+
+    sudo apt install fonts-dejavu-core fonts-dejavu-mono fonts-dejavu-extra fonts-liberation fonts-noto-color-emoji
+
+`packaging/build-deb.sh` builds the `.deb` in `target/debian/`. It needs
+`dpkg-dev`.
 
 ## Process isolation
 

@@ -13,6 +13,7 @@ mod filter_lists;
 mod find_bar;
 mod location;
 mod location_bar;
+mod page_fonts;
 mod password_manager;
 mod password_prompts;
 mod passwords;
@@ -75,6 +76,12 @@ fn main() -> ExitCode {
         }
     };
 
+    // Before GLib or GTK starts any thread, as it sets an environment variable.
+    let page_fonts = page_fonts::apply(&dirs.config, &dirs.cache);
+    if let Some(note) = page_fonts.note() {
+        eprintln!("{note}");
+    }
+
     // Icons in it are found by name, as the application adds its icons
     // directory, under the resource path its ID implies, to the icon theme.
     let resources = gio::Resource::from_data(&glib::Bytes::from_static(include_bytes!(concat!(
@@ -88,7 +95,9 @@ fn main() -> ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
-    app.connect_activate(move |app| browser::open(app, dirs.clone(), start_url.clone()));
+    app.connect_activate(move |app| {
+        browser::open(app, dirs.clone(), start_url.clone(), page_fonts.clone())
+    });
 
     // Our arguments were handled above, so that GTK doesn't try to open them as files.
     match app.run_with_args::<&str>(&[]) {
