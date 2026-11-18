@@ -72,6 +72,26 @@ Portions Copyright.  No license is given.
   everything from the site and its subdomains, even where there's an exception.
   They can be changed before Apply adds them to the end of your filter rules.
   The items stay selected, to delete them too if wanted.
+- Saved passwords for sites. When a password is entered in a form, a key
+  button appears after the location field, which asks whether to save it, with
+  the username and the hidden password to change first if need be. Each one
+  saved is a new record, even if the site already has one. The same username
+  and password aren't offered again for a site that has them.
+- Clicking in a username or password field, on a site that has saved
+  passwords, opens a menu of them, most recently created or edited first, with
+  when that was if there's more than one. Choosing one fills in the username
+  and password, and Escape closes the menu. Only passwords saved for exactly
+  the page's domain are offered, not those for its subdomains or for the
+  domains it's a subdomain of. Nothing is ever filled in without choosing from
+  this menu, and BrowseGoo never logs in by itself. The menu warns when the page
+  isn't HTTPS.
+- A Password Manager window, from the main menu, which lists the saved
+  passwords with their site, username, and when each was created, last edited
+  and last used. Selecting one shows it below, where it can be changed or
+  deleted. Its password stays hidden until Show Password is pressed, each time,
+  and while shown it can be selected and copied, but there's no button for
+  copying it. Passwords aren't site data, so they aren't deleted on quitting,
+  and they aren't in the Site Data Manager.
 - Page content runs in separate, sandboxed processes. See
   [Process isolation](#process-isolation).
 - The User-Agent is `BrowseGoo/` followed by the version.
@@ -101,7 +121,13 @@ being typed, as leaving its field would, unless it isn't valid.
 Bookmarks are in `~/.config/browsegoo/bookmarks.tsv`. Cookies are in
 `~/.local/share/browsegoo/cookies.sqlite`, with what sites store beside them, and
 WebKit's cache is in `~/.cache/browsegoo/web/`. Which of them are preserved is
-in `~/.config/browsegoo/preserved_site_data.tsv`.
+in `~/.config/browsegoo/preserved_site_data.tsv`. Saved passwords are in
+`~/.config/browsegoo/passwords.tsv`, which only you can read.
+
+The script that watches forms for passwords runs in a JavaScript world of its
+own, in each page's top frame. The page's scripts can't see it, or the handler
+it sends messages to, so they can't pretend to be it. It checks again that the
+page is still on the password's domain when filling it in.
 
 Which filter lists are enabled is in `~/.config/browsegoo/filter_lists.tsv`, and
 the downloaded lists are in `~/.cache/browsegoo/`, with WebKit's compiled
@@ -167,6 +193,10 @@ practical.
 This is a starting point, and these are not done yet:
 
 - There's only one window.
+- Saved passwords aren't encrypted. The file is only protected by its
+  permissions, like the cookies are, rather than kept in a keyring.
+- Passwords are only saved and filled in for login forms in a page's top frame,
+  not in frames within it.
 - There's no interface for downloads, or for permission requests such as for
   location or notifications, which are denied.
 - The shield button can't say how many requests were blocked, because WebKit

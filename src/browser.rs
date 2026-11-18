@@ -29,6 +29,9 @@ use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
 use crate::location_bar::LocationBar;
+use crate::password_manager::PasswordManager;
+use crate::password_prompts::{self, PageMessage};
+use crate::passwords::{self, Passwords};
 use crate::preferences::PreferencesWindow;
 use crate::preserved::Preserved;
 use crate::site_data::{self, SiteDataWindow};
@@ -121,6 +124,8 @@ struct Widgets {
     bookmark_list: gtk::ListBox,
     bookmarks_popover: gtk::Popover,
     find_bar: FindBar,
+    /// Shown while the active tab has a password entered that could be saved.
+    save_password: gtk::Button,
 }
 
 /// Identifies a tab, as WebKit views have no IDs of their own.
@@ -146,6 +151,15 @@ struct Tab {
     /// Whether that page of BrowseGoo's own is about to load, which isn't
     /// leaving it.
     loading_stand_in: Cell<bool>,
+    /// The password last entered on a page in this tab, which could be saved.
+    entered_password: RefCell<Option<EnteredPassword>>,
+}
+
+/// A password entered in a form, which BrowseGoo offers to save.
+struct EnteredPassword {
+    domain: String,
+    username: String,
+    password: String,
 }
 
 impl Tab {
@@ -231,6 +245,7 @@ struct Browser {
     bookmarks: RefCell<Bookmarks>,
     /// The cookies and site data that aren't deleted on quitting.
     preserved: Rc<RefCell<Preserved>>,
+    passwords: Rc<RefCell<Passwords>>,
     /// Whether the site data is being deleted, before quitting.
     quitting: Cell<bool>,
     /// Where WebKit keeps the compiled filter lists.
@@ -249,6 +264,7 @@ struct Browser {
     preferences: RefCell<Option<PreferencesWindow>>,
     bookmarks_editor: RefCell<Option<Rc<BookmarksEditor>>>,
     site_data: RefCell<Option<Rc<SiteDataWindow>>>,
+    password_manager: RefCell<Option<Rc<PasswordManager>>>,
     user_filters: RefCell<Option<Rc<UserFiltersWindow>>>,
 }
 
@@ -313,6 +329,11 @@ fn open_window(
             eprintln!("Could not read filter list settings: {error}");
             std::process::exit(1);
         });
+    let passwords = Passwords::load(dirs.config.join("passwords.tsv")).unwrap_or_else(|error| {
+        // Carrying on would overwrite the passwords that we couldn't read.
+        eprintln!("Could not read saved passwords: {error}");
+        std::process::exit(1);
+    });
     let filter_store = webkit::UserContentFilterStore::new(
         &filter_lists::compiled_dir(&dirs.cache).to_string_lossy(),
     );
@@ -326,6 +347,7 @@ fn open_window(
         settings,
         bookmarks: RefCell::new(bookmarks),
         preserved,
+        passwords: Rc::new(RefCell::new(passwords)),
         quitting: Cell::new(false),
         filter_store,
         filters: RefCell::new(Vec::new()),
@@ -338,6 +360,7 @@ fn open_window(
         preferences: RefCell::new(None),
         bookmarks_editor: RefCell::new(None),
         site_data: RefCell::new(None),
+        password_manager: RefCell::new(None),
         user_filters: RefCell::new(None),
     });
     BROWSER.set(Some(browser.clone()));
@@ -372,6 +395,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
     let reload = icon_button("view-refresh-symbolic", "Reload (Ctrl+R)", "win.reload");
     let main_menu = gio::Menu::new();
     main_menu.append(Some("Bookmarks"), Some("win.edit-bookmarks"));
+    main_menu.append(Some("Password Manager"), Some("win.passwords"));
     main_menu.append(Some("Site Data Manager"), Some("win.site-data"));
     main_menu.append(Some("Your Filter Rules"), Some("win.user-filters"));
     main_menu.append(Some("Preferences"), Some("win.preferences"));
@@ -395,6 +419,14 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         .hexpand(true)
         .input_purpose(gtk::InputPurpose::Url)
         .placeholder_text("Enter a location")
+        .build();
+
+    // Only while there's a password to save, so it's out of the way otherwise.
+    let save_password = gtk::Button::builder()
+        .icon_name("dialog-password-symbolic")
+        .tooltip_text("Save the password entered on this page")
+        .action_name("win.save-password")
+        .visible(false)
         .build();
 
     let bookmark = gtk::ToggleButton::builder()
@@ -430,6 +462,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         forward.upcast_ref(),
         reload.upcast_ref(),
         location.upcast_ref(),
+        save_password.upcast_ref(),
         filter_button.upcast_ref(),
         bookmark.upcast_ref(),
         bookmarks_button.upcast_ref(),
@@ -505,6 +538,7 @@ fn build_widgets(app: &gtk::Application) -> Widgets {
         bookmark_list,
         bookmarks_popover,
         filter_button,
+        save_password,
     }
 }
 
@@ -601,9 +635,15 @@ impl Browser {
             opener,
             stand_in: RefCell::new(None),
             loading_stand_in: Cell::new(false),
+            entered_password: RefCell::new(None),
         });
         tab.update_label();
         self.apply_filters(&tab);
+        password_prompts::watch_pages(&tab.content, move |message| {
+            if let Some(browser) = current_browser() {
+                browser.page_password_message(id, message);
+            }
+        });
         self.connect_webview(&tab);
 
         // The tab must be known before the tab strip announces it as active.
@@ -821,6 +861,7 @@ impl Browser {
         self.set_history_available(active.webview.can_go_back(), active.webview.can_go_forward());
         self.update_bookmark_button();
         self.update_filter_button();
+        self.update_save_password_button();
         if self.widgets.find_bar.is_open() {
             self.find(false);
         }
@@ -1069,6 +1110,8 @@ impl Browser {
         add_action("toggle-bookmark", Browser::toggle_bookmark);
         add_action("about", Browser::show_about);
         add_action("site-data", Browser::show_site_data);
+        add_action("passwords", Browser::show_password_manager);
+        add_action("save-password", Browser::ask_to_save_password);
         add_action("find", |browser| browser.widgets.find_bar.open());
         add_action("find-next", |browser| browser.find_again(false));
         add_action("find-previous", |browser| browser.find_again(true));
@@ -1255,6 +1298,120 @@ impl Browser {
         if let Some(window) = window {
             window.present();
         }
+    }
+
+    fn show_password_manager(&self) {
+        if self.password_manager.borrow().is_none() {
+            let window = PasswordManager::new(&self.widgets.window, self.passwords.clone());
+            self.password_manager.replace(Some(window));
+        }
+        let window = self.password_manager.borrow().clone();
+        if let Some(window) = window {
+            window.present();
+        }
+    }
+
+    /// Shows the saved passwords again in the Password Manager, if it's open.
+    fn passwords_changed(&self) {
+        let window = self.password_manager.borrow().clone();
+        if let Some(window) = window {
+            window.refresh();
+        }
+    }
+
+    /// Handles what the script in a tab's page says about its forms. Only the
+    /// page's own domain is used, and only when the tab is still on it.
+    fn page_password_message(&self, id: TabId, message: PageMessage) {
+        let Some(tab) = self.tab(id) else {
+            return;
+        };
+        let url = tab.webview.uri().map(String::from).unwrap_or_default();
+        let Some(domain) = passwords::domain_of(&url) else {
+            return;
+        };
+        match message {
+            PageMessage::Entered { host, username, password } => {
+                if host != domain || self.passwords.borrow().contains(&domain, &username, &password) {
+                    return;
+                }
+                tab.entered_password.replace(Some(EnteredPassword {
+                    domain,
+                    username,
+                    password,
+                }));
+                if self.is_active(id) {
+                    self.update_save_password_button();
+                }
+            }
+            PageMessage::Clicked { host, area } => {
+                if host != domain || !self.is_active(id) {
+                    return;
+                }
+                let records = self.passwords.borrow().for_domain(&domain);
+                if records.is_empty() {
+                    return;
+                }
+                let secure = url.starts_with("https:");
+                password_prompts::show_menu(&tab.webview, &area, &records, secure, move |record| {
+                    if let Some(browser) = current_browser() {
+                        browser.fill_password(id, record);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Fills in the saved password that was chosen from the menu in a tab.
+    fn fill_password(&self, id: TabId, record: passwords::RecordId) {
+        let (Some(tab), Some(record)) = (self.tab(id), self.passwords.borrow().get(record).cloned())
+        else {
+            return;
+        };
+        password_prompts::fill(&tab.webview, &record, move || {
+            let Some(browser) = current_browser() else {
+                return;
+            };
+            if let Err(error) = browser.passwords.borrow_mut().mark_used(record.id) {
+                eprintln!("Could not save when a password was used: {error}");
+            }
+            browser.passwords_changed();
+        });
+    }
+
+    fn update_save_password_button(&self) {
+        let entered = self
+            .active_tab()
+            .and_then(|tab| tab.entered_password.borrow().as_ref().map(|entered| entered.domain.clone()));
+        let button = &self.widgets.save_password;
+        if let Some(domain) = &entered {
+            button.set_tooltip_text(Some(&format!("Save the password entered on {domain}")));
+        }
+        button.set_visible(entered.is_some());
+    }
+
+    /// Asks whether to save the password entered in the active tab, which is
+    /// then no longer offered, whether it's saved or not.
+    fn ask_to_save_password(&self) {
+        let Some(entered) = self.active_tab().and_then(|tab| tab.entered_password.take()) else {
+            return;
+        };
+        self.update_save_password_button();
+        let domain = entered.domain.clone();
+        password_prompts::ask_to_save(
+            &self.widgets.window,
+            &entered.domain,
+            &entered.username,
+            &entered.password,
+            move |username, password| {
+                let Some(browser) = current_browser() else {
+                    return Ok(());
+                };
+                let added = browser.passwords.borrow_mut().add(&domain, username, password);
+                added.map_err(|error| format!("Could not save the password: {error}"))?;
+                browser.passwords_changed();
+                Ok(())
+            },
+        );
     }
 
     fn show_bookmarks_editor(self: &Rc<Self>) {
