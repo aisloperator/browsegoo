@@ -6,7 +6,7 @@
 //! kind for a site, so each of those is one row.
 //!
 //! What isn't preserved is deleted by `delete_unpreserved`, when BrowseGoo
-//! quits and when it starts.
+//! quits and when it starts, and with the window's Clean Up button.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -237,11 +237,13 @@ pub struct SiteDataWindow {
     details: gtk::Grid,
     count: gtk::Label,
     delete: gtk::Button,
+    cleanup: gtk::Button,
     block: gtk::Button,
     /// Adds rules to the end of the user's own.
     add_rules: Rc<dyn Fn(&str) -> Result<(), String>>,
     cookies: webkit::CookieManager,
     data: webkit::WebsiteDataManager,
+    preserved: Rc<RefCell<Preserved>>,
     /// Counts listings, so that only the newest one is shown.
     generation: Cell<u64>,
     refresh_scheduled: Cell<bool>,
@@ -337,6 +339,7 @@ impl SiteDataWindow {
         columns.set_model(Some(&selection));
 
         add_preserve_column(&columns, &preserved);
+        let preserved_for_cleanup = preserved.clone();
         let site = add_column(&columns, "Site", 200, |entry| entry.host.clone());
         add_column(&columns, "Type", 130, |entry| entry.kind.to_owned());
         add_column(&columns, "Name", 160, |entry| entry.name.clone());
@@ -373,6 +376,11 @@ impl SiteDataWindow {
             .sensitive(false)
             .css_classes(["destructive-action"])
             .build();
+        let cleanup = gtk::Button::builder()
+            .label("Clean Up…")
+            .tooltip_text("Delete everything that isn't preserved, as quitting does")
+            .css_classes(["destructive-action"])
+            .build();
         let block = gtk::Button::builder()
             .label("Block…")
             .sensitive(false)
@@ -382,6 +390,7 @@ impl SiteDataWindow {
         bottom.append(&count);
         bottom.append(&block);
         bottom.append(&delete);
+        bottom.append(&cleanup);
         content.append(&bottom);
 
         let window = gtk::Window::builder()
@@ -404,10 +413,12 @@ impl SiteDataWindow {
             details,
             count,
             delete,
+            cleanup,
             block,
             add_rules: Rc::new(add_rules),
             cookies,
             data,
+            preserved: preserved_for_cleanup,
             generation: Cell::new(0),
             refresh_scheduled: Cell::new(false),
             deleting: Cell::new(false),
@@ -465,6 +476,8 @@ impl SiteDataWindow {
         refresh.connect_clicked(move |_| refresh_now());
         let delete_selected = with(Self::delete_selected);
         this.delete.connect_clicked(move |_| delete_selected());
+        let clean_up = with(Self::clean_up);
+        this.cleanup.connect_clicked(move |_| clean_up());
         let block_selected = with(Self::block_selected);
         this.block.connect_clicked(move |_| block_selected());
 
@@ -598,6 +611,7 @@ impl SiteDataWindow {
         }
         self.count.set_text(&text);
         self.delete.set_sensitive(selected > 0 && !self.deleting.get());
+        self.cleanup.set_sensitive(!self.deleting.get());
         self.block.set_sensitive(selected > 0);
     }
 
@@ -666,12 +680,49 @@ impl SiteDataWindow {
         });
     }
 
+    /// Deletes everything that isn't preserved, as quitting does, once the
+    /// user says to. Open pages keep running, and can store some of it again.
+    /// Deleting a site's IndexedDB closes its open pages' connections to it,
+    /// which then fail until the page is reloaded.
+    fn clean_up(self: &Rc<Self>) {
+        if self.deleting.get() {
+            return;
+        }
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message("Delete everything that isn't preserved?")
+            .detail(
+                "All the cookies and site data without Preserve checked will be \
+                 deleted, as when BrowseGoo quits. Pages that are open might need \
+                 to be reloaded to work properly, and can store some of it again.",
+            )
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
+            if dialog.choose_future(Some(&this.window)).await != Ok(1)
+                || this.deleting.replace(true)
+            {
+                return;
+            }
+            this.show_count();
+            delete_unpreserved(&this.cookies, &this.data, &this.preserved).await;
+            this.deleting.set(false);
+            this.refresh();
+        });
+    }
+
     fn delete_selected(self: &Rc<Self>) {
         let selected = self.selected();
         if selected.is_empty() || self.deleting.replace(true) {
             return;
         }
-        self.delete.set_sensitive(false);
+        self.show_count();
         let weak = Rc::downgrade(self);
         let cookies = self.cookies.clone();
         let data = self.data.clone();

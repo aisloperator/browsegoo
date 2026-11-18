@@ -67,6 +67,10 @@ Portions Copyright.  No license is given.
 - A Preserve checkbox for each item in the Site Data Manager, off at first,
   which keeps that item when BrowseGoo quits. It stays checked if the item is
   deleted, so that the site can store it again and have it kept.
+- The Site Data Manager's Clean Up button deletes everything that isn't
+  preserved, as quitting does, after asking. Open tabs keep their pages, which
+  can store some of it again. A page might need to be reloaded to work
+  properly, such as one that had its IndexedDB open.
 - The Site Data Manager's Block button writes a rule for each site
   of the selected items, such as `||ads.example.com^$important`, which blocks
   everything from the site and its subdomains, even where there's an exception.
