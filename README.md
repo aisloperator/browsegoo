@@ -110,7 +110,7 @@ Portions Copyright.  No license is given.
   `navigator.userAgent`, is chosen in the preferences:
   - Actual, the default, says BrowseGoo and its version, with WebKit's usual
     tokens, but not the window system, operating system or hardware:
-    `Mozilla/5.0 () AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 BrowseGoo/0.3.0`.
+    `Mozilla/5.0 () AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 BrowseGoo/0.4.0`.
   - Development: WebKit (default) is WebKit's own, which says it's Safari.
   - Development: Chrome on MS on Intel and Development: Firefox on MS on
     Intel are those of the latest Chrome and Firefox on 64-bit Windows 11,
