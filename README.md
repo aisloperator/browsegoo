@@ -1,7 +1,7 @@
 # BrowseGoo
 
 BrowseGoo is a Web browser for the Linux desktop, built with
-[WebKit](https://webkitgtk.org/), [GTK4](https://www.gtk.org/), and [Rust](https://www.rust-lang.org/).
+[WebKit](https://webkit.org/), [GTK4](https://www.gtk.org/), and [Rust](https://www.rust-lang.org/).
 
 Created by [AI Sloperator](https://www.aisloperator.com/) with Claude Code.
 
