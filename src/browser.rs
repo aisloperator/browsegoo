@@ -1394,6 +1394,14 @@ impl Browser {
         Ok(())
     }
 
+    fn show_list_statuses(&self, statuses: BTreeMap<&'static str, ListStatus>) {
+        self.list_statuses.replace(statuses);
+        if let Some(preferences) = self.preferences.borrow().as_ref() {
+            preferences.show_statuses(&self.list_statuses.borrow());
+        }
+        self.show_user_filters_status();
+    }
+
     fn show_user_filters_status(&self) {
         if let Some(window) = self.user_filters.borrow().as_ref() {
             let statuses = self.list_statuses.borrow();
@@ -1684,6 +1692,11 @@ impl Browser {
             if !is_current() {
                 return;
             }
+            // Compiling can take a while, so show what was downloaded now,
+            // and any problems compiling once it's done.
+            if let Some(browser) = current_browser() {
+                browser.show_list_statuses(statuses.clone());
+            }
 
             let mut filters = Vec::new();
             for list in converted {
@@ -1727,11 +1740,7 @@ impl Browser {
             for tab in browser.tabs.borrow().iter() {
                 browser.apply_filters(tab);
             }
-            browser.list_statuses.replace(statuses);
-            if let Some(preferences) = browser.preferences.borrow().as_ref() {
-                preferences.show_statuses(&browser.list_statuses.borrow());
-            }
-            browser.show_user_filters_status();
+            browser.show_list_statuses(statuses);
             browser.update_filter_button();
             browser.filters_loaded.set(true);
             browser.load_start_page();
