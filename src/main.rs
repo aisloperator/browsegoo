@@ -18,6 +18,7 @@ mod password_prompts;
 mod passwords;
 mod preferences;
 mod preserved;
+mod privacy;
 mod site_data;
 mod user_filters;
 

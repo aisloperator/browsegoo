@@ -143,6 +143,18 @@ Changing them compiles the lists again, which takes a while, but changing your
 other rules doesn't. Your blocking rules block even what a list makes an
 exception for.
 
+## Privacy & Security
+
+- Hyperlink auditing is off. A link with a `ping` attribute, such as
+  `<a href="https://example.com/" ping="https://tracker.example/">`, is followed
+  as usual, but BrowseGoo doesn't also send the `ping` URLs a request saying
+  that it was followed, which WebKit would otherwise do. WebKitGTK's setting
+  for this no longer works, so BrowseGoo removes `ping` attributes from every
+  page and frame as they appear, with a script that runs apart from the page's
+  own, so that they can't stop it or add one back in time for a click. Pages
+  can see that the attributes are gone, and can still track clicks in other
+  ways, such as with scripts, `navigator.sendBeacon()` or redirecting links.
+
 ## Building
 
 You need stable Rust from [rustup](https://rustup.rs/), a C compiler, and the

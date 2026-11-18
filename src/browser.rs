@@ -33,6 +33,7 @@ use crate::password_manager::PasswordManager;
 use crate::password_prompts::{self, PageMessage};
 use crate::passwords::{self, Passwords};
 use crate::preferences::PreferencesWindow;
+use crate::privacy;
 use crate::preserved::Preserved;
 use crate::site_data::{self, SiteDataWindow};
 use crate::user_filters::UserFiltersWindow;
@@ -639,6 +640,7 @@ impl Browser {
         });
         tab.update_label();
         self.apply_filters(&tab);
+        privacy::add_scripts(&tab.content);
         password_prompts::watch_pages(&tab.content, move |message| {
             if let Some(browser) = current_browser() {
                 browser.page_password_message(id, message);
