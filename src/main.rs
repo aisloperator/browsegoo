@@ -23,6 +23,7 @@ mod preserved;
 mod privacy;
 mod site_data;
 mod socks_proxy;
+mod user_agent;
 mod user_filters;
 
 use std::process::ExitCode;

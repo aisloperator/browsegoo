@@ -40,6 +40,7 @@ use crate::preferences::PreferencesWindow;
 use crate::privacy;
 use crate::preserved::Preserved;
 use crate::site_data::{self, SiteDataWindow};
+use crate::user_agent;
 use crate::socks_proxy::SocksProxy;
 use crate::user_filters::UserFiltersWindow;
 
@@ -153,8 +154,20 @@ fn current_browser() -> Option<Rc<Browser>> {
     BROWSER.with_borrow(Clone::clone)
 }
 
+/// WebKit's default User-Agent.
+fn webkit_user_agent() -> String {
+    webkit::Settings::new().user_agent().map(String::from).unwrap_or_default()
+}
+
+/// BrowseGoo's own User-Agent, for its own requests.
 fn user_agent() -> String {
-    format!("BrowseGoo/{VERSION}")
+    user_agent::actual(&webkit_user_agent())
+}
+
+/// Gives pages the chosen User-Agent, in both request headers and JavaScript.
+fn apply_user_agent(settings: &webkit::Settings, choice: user_agent::Choice) {
+    settings.set_user_agent(choice.value(&webkit_user_agent()).as_deref());
+    settings.set_enable_site_specific_quirks(choice.allows_site_fixes());
 }
 
 /// Where BrowseGoo keeps things, which are created before the browser opens.
@@ -455,7 +468,7 @@ fn open_window(
     proxy: SocksProxy,
 ) {
     let settings = webkit::Settings::new();
-    settings.set_user_agent(Some(&user_agent()));
+    apply_user_agent(&settings, user_agent::chosen(&dirs.config));
 
     let bookmarks = Bookmarks::load(dirs.config.join("bookmarks.tsv")).unwrap_or_else(|error| {
         // Carrying on would overwrite the bookmarks that we couldn't read.
@@ -1996,7 +2009,21 @@ impl Browser {
                 &self.filter_settings.borrow(),
                 page_fonts::is_chosen(&self.dirs.config),
                 self.page_fonts.note().as_deref(),
+                user_agent::chosen(&self.dirs.config),
             );
+            preferences.user_agent.connect_selected_notify(|dropdown| {
+                let Some(browser) = current_browser() else {
+                    return;
+                };
+                let Some(&choice) = user_agent::Choice::ALL.get(dropdown.selected() as usize)
+                else {
+                    return;
+                };
+                apply_user_agent(&browser.settings, choice);
+                if let Err(error) = user_agent::choose(&browser.dirs.config, choice) {
+                    eprintln!("Could not save the User-Agent setting: {error}");
+                }
+            });
             preferences.limit_fonts.connect_toggled(|check| {
                 let Some(browser) = current_browser() else {
                     return;

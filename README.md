@@ -106,7 +106,22 @@ Portions Copyright.  No license is given.
   and they aren't in the Site Data Manager.
 - Page content runs in separate, sandboxed processes. See
   [Process isolation](#process-isolation).
-- The User-Agent is `BrowseGoo/` followed by the version.
+- The User-Agent that pages get, in request headers and as
+  `navigator.userAgent`, is chosen in the preferences:
+  - Actual, the default, says BrowseGoo and its version, with WebKit's usual
+    tokens, but not the window system, operating system or hardware:
+    `Mozilla/5.0 () AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 BrowseGoo/0.3.0`.
+  - Development: WebKit (default) is WebKit's own, which says it's Safari.
+  - Development: Chrome on MS on Intel and Development: Firefox on MS on
+    Intel are those of the latest Chrome and Firefox on 64-bit Windows 11,
+    for developing sites that treat browsers differently.
+  - Among WebKit's fixes for particular sites, it tells some, such as
+    DuckDuckGo and Google's, that it's Safari on a Mac. Those fixes are only
+    on with WebKit's default, so that with the others every page gets the
+    User-Agent chosen.
+  - A change takes effect when a page is next loaded. The choice is in
+    `~/.config/browsegoo/user_agent.txt`. BrowseGoo's own requests, for filter
+    lists, always use Actual.
 
 | Shortcut                    | Action                      |
 |-----------------------------|-----------------------------|

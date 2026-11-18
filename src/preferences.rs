@@ -1,4 +1,5 @@
-//! The preferences window, for the fonts that pages can use, and filter lists.
+//! The preferences window, for the fonts that pages can use, the User-Agent,
+//! and filter lists.
 
 use std::collections::BTreeMap;
 use std::time::UNIX_EPOCH;
@@ -8,6 +9,7 @@ use gtk::prelude::*;
 
 use crate::closing;
 use crate::filter_lists::{LISTS, ListStatus, Settings};
+use crate::user_agent::Choice;
 
 pub struct ListRow {
     pub id: &'static str,
@@ -22,6 +24,8 @@ pub struct PreferencesWindow {
     update_status: gtk::Label,
     /// Whether to limit the fonts that pages can use, from the next start.
     pub limit_fonts: gtk::CheckButton,
+    /// Which User-Agent pages get, in the order of `Choice::ALL`.
+    pub user_agent: gtk::DropDown,
 }
 
 impl PreferencesWindow {
@@ -32,6 +36,7 @@ impl PreferencesWindow {
         settings: &Settings,
         limit_fonts: bool,
         fonts_note: Option<&str>,
+        user_agent: Choice,
     ) -> Self {
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -78,6 +83,26 @@ impl PreferencesWindow {
             note.add_css_class("warning");
             content.append(&note);
         }
+
+        content.append(&section("User-Agent"));
+        let labels: Vec<&str> = Choice::ALL.iter().map(|choice| choice.label()).collect();
+        let user_agent_choices = gtk::DropDown::from_strings(&labels);
+        user_agent_choices.set_halign(gtk::Align::Start);
+        user_agent_choices.set_selected(
+            Choice::ALL.iter().position(|&choice| choice == user_agent).unwrap_or(0) as u32,
+        );
+        content.append(&user_agent_choices);
+        content.append(&explain(
+            "What pages are told this browser is, in requests and to their \
+             scripts. Actual says BrowseGoo and its version, but not the window \
+             system, operating system or hardware. The others are for developing \
+             sites that treat browsers differently: WebKit's default says it's \
+             Safari, and the others are those of the latest Chrome and Firefox on \
+             64-bit Windows 11. With WebKit's default, WebKit can tell some sites \
+             it's another browser, among its fixes for particular sites, which \
+             are off with the others so that every page gets the same one. A \
+             change takes effect when a page is next loaded.",
+        ));
 
         let heading = gtk::Label::builder()
             .label("Filter Lists")
@@ -163,6 +188,7 @@ impl PreferencesWindow {
             update,
             update_status,
             limit_fonts,
+            user_agent: user_agent_choices,
         }
     }
 
