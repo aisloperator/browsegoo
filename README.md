@@ -96,21 +96,22 @@ Portions Copyright.  No license is given.
   [Process isolation](#process-isolation).
 - The User-Agent is `BrowseGoo/` followed by the version.
 
-| Shortcut                    | Action               |
-|-----------------------------|----------------------|
-| Ctrl+L                      | Go to location field |
-| Ctrl+T                      | New tab              |
-| Ctrl+W                      | Close tab            |
-| Ctrl+Tab, Ctrl+PageDown     | Next tab             |
-| Ctrl+Shift+Tab, Ctrl+PageUp | Previous tab         |
-| Ctrl+F                      | Find in page         |
-| Ctrl+G, F3                  | Find next            |
-| Ctrl+Shift+G, Shift+F3      | Find previous        |
-| Ctrl+D                      | Toggle bookmark      |
-| Ctrl+Shift+O                | Edit bookmarks       |
-| Ctrl+R, F5                  | Reload               |
-| Alt+Left, Alt+Right         | Back, forward        |
-| Ctrl+Q                      | Quit                 |
+| Shortcut                    | Action                      |
+|-----------------------------|-----------------------------|
+| Ctrl+L                      | Go to location field        |
+| Ctrl+T                      | New tab                     |
+| Ctrl+W                      | Close tab                   |
+| Ctrl+Tab, Ctrl+PageDown     | Next tab                    |
+| Ctrl+Shift+Tab, Ctrl+PageUp | Previous tab                |
+| Ctrl+F                      | Find in page                |
+| Ctrl+G, F3                  | Find next                   |
+| Ctrl+Shift+G, Shift+F3      | Find previous               |
+| Ctrl+D                      | Toggle bookmark             |
+| Ctrl+Shift+O                | Edit bookmarks              |
+| Ctrl+R, F5                  | Reload                      |
+| Ctrl+Shift+R, Shift+F5      | Reload, not using the cache |
+| Alt+Left, Alt+Right         | Back, forward               |
+| Ctrl+Q                      | Quit                        |
 
 A tab can also be closed by middle-clicking it. Closing the last tab quits.
 

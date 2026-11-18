@@ -259,10 +259,12 @@ impl Tab {
     }
 
     /// Reloads the page, or tries loading it again after it crashed or was
-    /// blocked.
-    fn reload(&self) {
+    /// blocked. A forced reload fetches everything again instead of using the
+    /// cache.
+    fn reload(&self, force: bool) {
         match self.stand_in.take() {
             Some(url) => self.load_for_user(&url),
+            None if force => self.webview.reload_bypass_cache(),
             None => self.webview.reload(),
         }
     }
@@ -1247,7 +1249,12 @@ impl Browser {
         });
         add_action("reload", |browser| {
             if let Some(tab) = browser.active_tab() {
-                tab.reload();
+                tab.reload(false);
+            }
+        });
+        add_action("force-reload", |browser| {
+            if let Some(tab) = browser.active_tab() {
+                tab.reload(true);
             }
         });
         add_action("focus-location", |browser| {
@@ -1304,6 +1311,7 @@ impl Browser {
         app.set_accels_for_action("win.back", &["<Alt>Left"]);
         app.set_accels_for_action("win.forward", &["<Alt>Right"]);
         app.set_accels_for_action("win.reload", &["<Control>r", "F5"]);
+        app.set_accels_for_action("win.force-reload", &["<Control><Shift>r", "<Shift>F5"]);
         app.set_accels_for_action("win.focus-location", &["<Control>l"]);
         app.set_accels_for_action("win.find", &["<Control>f"]);
         app.set_accels_for_action("win.find-next", &["<Control>g", "F3"]);
