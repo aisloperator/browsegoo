@@ -175,6 +175,28 @@ exception for.
     of the fonts and the libraries that draw them, such as on the same Debian
     release. Fonts aren't limited if DejaVu Sans isn't installed, and the
     preferences say if any of the fonts are missing.
+- Pages can't reach this computer or the local network, unless they're on the
+  same local address themselves. A page from a public site can't load anything
+  from `localhost`, `127.0.0.1`, a private address such as `192.168.1.1` or
+  `10.0.0.1`, or a local name such as `printer.local` or `router`, whether with
+  scripts, images, frames, forms, WebSockets or redirects, and can't send the
+  tab there. A page from a local address, such as a development server on
+  `http://localhost:3000/`, can reach that same host and port, and public
+  sites, but not any other local address or port.
+  - The user can always go to a local address, from the location field,
+    bookmarks, Back and Forward, or Reload. When a page's link or form tries to
+    go to one, the tab says so instead, and Reload opens it.
+  - Local addresses are loopback, private, link-local and shared ("CGNAT")
+    IPv4 and IPv6 addresses, and `0.0.0.0`. Local names are `localhost`, names
+    with no dots, and names ending in `.localhost`, `.local`, `.lan`,
+    `.home.arpa`, `.internal`, `.localdomain` or `.test`.
+  - So that a public site's name can't be made to point at a local address
+    instead, as with DNS rebinding, WebKit connects through a proxy of
+    BrowseGoo's own, which looks up names itself, and won't connect to a local
+    address for a name that isn't a local one. Such a name gets a page saying
+    so. For a server of your own, use its address, or a local name.
+  - The proxy only listens on 127.0.0.1, and only takes connections with a user
+    name and password that are made up each time BrowseGoo starts.
 
 ## Building
 
@@ -232,6 +254,12 @@ practical.
 ## Known limitations
 
 This is a starting point, and these are not done yet:
+
+- The desktop's proxy settings aren't used, as WebKit connects through
+  BrowseGoo's own proxy, which connects directly.
+- A local page can only reach its host and port as written in its address, so
+  a page from `http://localhost:3000/` can't reach `http://127.0.0.1:3000/`,
+  though it's the same server.
 
 - There's only one window.
 - Saved passwords aren't encrypted. The file is only protected by its

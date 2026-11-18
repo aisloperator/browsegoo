@@ -12,6 +12,7 @@ mod filter;
 mod filter_lists;
 mod find_bar;
 mod location;
+mod local_network;
 mod location_bar;
 mod page_fonts;
 mod password_manager;
@@ -21,6 +22,7 @@ mod preferences;
 mod preserved;
 mod privacy;
 mod site_data;
+mod socks_proxy;
 mod user_filters;
 
 use std::process::ExitCode;

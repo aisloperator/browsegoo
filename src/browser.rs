@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -28,6 +29,7 @@ use crate::decorations;
 use crate::find_bar::FindBar;
 use crate::filter_lists::{self, LISTS, ListStatus};
 use crate::location::parse_location;
+use crate::local_network::{self, LocalOrigin};
 use crate::location_bar::LocationBar;
 use crate::page_fonts;
 use crate::password_manager::PasswordManager;
@@ -37,6 +39,7 @@ use crate::preferences::PreferencesWindow;
 use crate::privacy;
 use crate::preserved::Preserved;
 use crate::site_data::{self, SiteDataWindow};
+use crate::socks_proxy::SocksProxy;
 use crate::user_filters::UserFiltersWindow;
 
 const INITIAL_WIDTH: i32 = 1024;
@@ -47,6 +50,11 @@ const NEW_TAB_TITLE: &str = "New Tab";
 /// How long quitting waits for the site data that isn't preserved to be
 /// deleted. What's left is deleted the next time BrowseGoo starts.
 const DELETING_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long what the user asked a tab to load counts as asked for, if WebKit
+/// hasn't asked whether to go there by then. It can take a while, when a web
+/// process is starting.
+const USER_LOAD_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Finding text in a page counts at most this many matches.
 pub const MOST_MATCHES: u32 = 1000;
@@ -77,6 +85,39 @@ fn blocked_page(url: &str) -> String {
     )
 }
 
+/// What a tab shows instead of a page on this computer or the local network,
+/// which another page tried to open.
+fn local_network_page(url: &str, from: &str) -> String {
+    format!(
+        "<!doctype html><title>Blocked</title>\
+         <body style=\"font: 16px sans-serif; margin: 3em\">\
+         <h1 style=\"font-size: 1.5em\">This page is on your computer or local network</h1>\
+         <p>A page from <span style=\"word-break: break-all\">{}</span> tried to open \
+         <span style=\"word-break: break-all\">{}</span>. BrowseGoo doesn't let pages \
+         reach your computer or local network from other addresses.</p>\
+         <p>If you meant to open it, press Reload.</p>",
+        escape_html(from),
+        escape_html(url)
+    )
+}
+
+/// What a tab shows instead of a page whose name is a public one, but is for an
+/// address on this computer or the local network.
+fn public_name_page(url: &str) -> String {
+    format!(
+        "<!doctype html><title>Blocked</title>\
+         <body style=\"font: 16px sans-serif; margin: 3em\">\
+         <h1 style=\"font-size: 1.5em\">This name is for your computer or local network</h1>\
+         <p>The name in <span style=\"word-break: break-all\">{}</span> isn't one for \
+         a local network, but it's for an address on your computer or local network. \
+         BrowseGoo doesn't connect to those, as a site could use its own name to reach \
+         them.</p>\
+         <p>If this is your own server, use its address, such as 127.0.0.1, or a name \
+         ending in .localhost, .local, .lan, .home.arpa, .internal or .test.</p>",
+        escape_html(url)
+    )
+}
+
 fn escape_html(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -85,10 +126,14 @@ fn escape_html(text: &str) -> String {
 }
 
 /// Why a tab shows a page of BrowseGoo's own in place of one.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum StandInReason {
     Crashed,
     Blocked,
+    /// A page from this address tried to open a local one.
+    LocalNetwork(String),
+    /// The page's name isn't a local one, but is for a local address.
+    PublicNameForLocalAddress,
 }
 
 thread_local! {
@@ -155,6 +200,15 @@ struct Tab {
     loading_stand_in: Cell<bool>,
     /// The password last entered on a page in this tab, which could be saved.
     entered_password: RefCell<Option<EnteredPassword>>,
+    /// The page shown, once it's started arriving, which is the one that
+    /// leaving it comes from.
+    committed: RefCell<Option<Url>>,
+    /// What the user asked this tab to load, and when, until WebKit asks
+    /// whether to go there, as only the user can open a local address from
+    /// another one. WebKit can ask after the user asks for something else.
+    user_loads: RefCell<Vec<(Url, Instant)>>,
+    /// Whether the user pressed Back or Forward, until the tab starts going.
+    user_history: Cell<bool>,
 }
 
 /// A password entered in a form, which BrowseGoo offers to save.
@@ -208,8 +262,34 @@ impl Tab {
     /// blocked.
     fn reload(&self) {
         match self.stand_in.take() {
-            Some(url) => self.webview.load_uri(&url),
+            Some(url) => self.load_for_user(&url),
             None => self.webview.reload(),
+        }
+    }
+
+    /// Loads `url` because the user asked for it, such as from the location
+    /// field, which can open a local address from any page.
+    fn load_for_user(&self, url: &str) {
+        if let Ok(parsed) = Url::parse(url) {
+            self.user_loads.borrow_mut().push((parsed, Instant::now()));
+        }
+        self.webview.load_uri(url);
+    }
+
+    /// Whether the navigation to `target` is one the user asked for, which
+    /// it's then no longer waiting for.
+    fn take_user_navigation(&self, target: &Url, kind: webkit::NavigationType) -> bool {
+        if kind == webkit::NavigationType::BackForward && self.user_history.take() {
+            return true;
+        }
+        let mut loads = self.user_loads.borrow_mut();
+        loads.retain(|(_, asked)| asked.elapsed() < USER_LOAD_TIME_LIMIT);
+        match loads.iter().position(|(url, _)| url == target) {
+            Some(position) => {
+                loads.remove(position);
+                true
+            }
+            None => false,
         }
     }
 
@@ -218,6 +298,8 @@ impl Tab {
         let html = match reason {
             StandInReason::Crashed => CRASHED_PAGE.to_owned(),
             StandInReason::Blocked => blocked_page(&url),
+            StandInReason::LocalNetwork(from) => local_network_page(&url, &from),
+            StandInReason::PublicNameForLocalAddress => public_name_page(&url),
         };
         self.stand_in.replace(Some(url));
         self.loading_stand_in.set(true);
@@ -256,6 +338,20 @@ struct Browser {
     filter_store: webkit::UserContentFilterStore,
     /// The compiled filter lists in use.
     filters: RefCell<Vec<webkit::UserContentFilter>>,
+    /// Whether the filter lists have been loaded since starting.
+    filters_loaded: Cell<bool>,
+    /// The content blocker that keeps pages from reaching local addresses,
+    /// which every tab uses, even when it isn't filtered.
+    local_filter: RefCell<Option<webkit::UserContentFilter>>,
+    /// The local hosts and ports that pages on them can reach, as the user
+    /// has gone to them.
+    local_origins: RefCell<Vec<LocalOrigin>>,
+    /// Counts compilations of the local network rules, so that only the
+    /// newest one is used.
+    local_generation: Cell<u64>,
+    /// WebKit connects through it, so that public names can't be used to
+    /// reach local addresses.
+    proxy: SocksProxy,
     filter_settings: RefCell<filter_lists::Settings>,
     list_statuses: RefCell<BTreeMap<&'static str, ListStatus>>,
     /// Counts filter reloads, so that only the newest one is used.
@@ -289,6 +385,16 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page
         dirs.data.to_str(),
         dirs.cache.join("web").to_str(),
     );
+    // Every connection goes through it, including to local addresses.
+    let proxy = SocksProxy::start().unwrap_or_else(|error| {
+        // Carrying on would let public names reach local addresses.
+        eprintln!("Could not start BrowseGoo's proxy: {error}");
+        std::process::exit(1);
+    });
+    network_session.set_proxy_settings(
+        webkit::NetworkProxyMode::Custom,
+        Some(&webkit::NetworkProxySettings::new(Some(&proxy.uri), &[])),
+    );
     if let Some(cookies) = network_session.cookie_manager() {
         if let Some(path) = dirs.data.join("cookies.sqlite").to_str() {
             cookies.set_persistent_storage(path, webkit::CookiePersistentStorage::Sqlite);
@@ -313,7 +419,7 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page
         ) {
             site_data::delete_unpreserved(&cookies, &data, &preserved).await;
         }
-        open_window(&app, dirs, start_url, network_session, preserved, page_fonts);
+        open_window(&app, dirs, start_url, network_session, preserved, page_fonts, proxy);
         drop(hold);
     });
 }
@@ -325,6 +431,7 @@ fn open_window(
     network_session: webkit::NetworkSession,
     preserved: Rc<RefCell<Preserved>>,
     page_fonts: page_fonts::State,
+    proxy: SocksProxy,
 ) {
     let settings = webkit::Settings::new();
     settings.set_user_agent(Some(&user_agent()));
@@ -363,6 +470,11 @@ fn open_window(
         quitting: Cell::new(false),
         filter_store,
         filters: RefCell::new(Vec::new()),
+        filters_loaded: Cell::new(false),
+        local_filter: RefCell::new(None),
+        local_origins: RefCell::new(Vec::new()),
+        local_generation: Cell::new(0),
+        proxy,
         filter_settings: RefCell::new(filter_settings),
         list_statuses: RefCell::new(BTreeMap::new()),
         filter_generation: Cell::new(0),
@@ -388,6 +500,7 @@ fn open_window(
         browser.start_page.replace(Some((tab.id, start_url)));
     }
     browser.reload_filters();
+    browser.compile_local_filter(None);
 
     browser.widgets.window.present();
     browser.focus_page_or_location();
@@ -648,6 +761,9 @@ impl Browser {
             stand_in: RefCell::new(None),
             loading_stand_in: Cell::new(false),
             entered_password: RefCell::new(None),
+            committed: RefCell::new(None),
+            user_loads: RefCell::new(Vec::new()),
+            user_history: Cell::new(false),
         });
         tab.update_label();
         self.apply_filters(&tab);
@@ -705,10 +821,21 @@ impl Browser {
             let Some(browser) = current_browser() else {
                 return;
             };
-            if let (webkit::LoadEvent::Started, Some(tab)) = (event, browser.tab(id)) {
-                if !tab.loading_stand_in.take() {
-                    tab.stand_in.replace(None);
+            let Some(tab) = browser.tab(id) else {
+                return;
+            };
+            match event {
+                webkit::LoadEvent::Started => {
+                    if !tab.loading_stand_in.take() {
+                        tab.stand_in.replace(None);
+                    }
+                    tab.user_history.set(false);
                 }
+                webkit::LoadEvent::Committed => {
+                    let url = tab.webview.uri().and_then(|url| Url::parse(&url).ok());
+                    tab.committed.replace(url);
+                }
+                _ => {}
             }
         });
         if let Some(history) = webview.back_forward_list() {
@@ -737,6 +864,11 @@ impl Browser {
             let Some(action) = decision.navigation_action() else {
                 return false;
             };
+            if let Some(browser) = current_browser() {
+                if browser.decide_local_navigation(id, decision, &action) {
+                    return true;
+                }
+            }
             let modifiers = gdk::ModifierType::from_bits_truncate(action.modifiers());
             let new_tab = action.navigation_type() == webkit::NavigationType::LinkClicked
                 && (action.mouse_button() == gdk::BUTTON_MIDDLE
@@ -760,11 +892,23 @@ impl Browser {
             let Some(tab) = current_browser().and_then(|browser| browser.tab(id)) else {
                 return false;
             };
-            if !error.matches(webkit::PolicyError::__Unknown(BLOCKED_BY_CONTENT_BLOCKER)) {
-                return false;
+            if error.matches(webkit::PolicyError::__Unknown(BLOCKED_BY_CONTENT_BLOCKER)) {
+                tab.show_stand_in(url.to_owned(), StandInReason::Blocked);
+                return true;
             }
-            tab.show_stand_in(url.to_owned(), StandInReason::Blocked);
-            true
+            let refused = current_browser().is_some_and(|browser| {
+                Url::parse(url).ok().is_some_and(|url| {
+                    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+                        return false;
+                    };
+                    browser.proxy.refused(host, port)
+                })
+            });
+            if refused {
+                tab.show_stand_in(url.to_owned(), StandInReason::PublicNameForLocalAddress);
+                return true;
+            }
+            false
         });
 
         // A page that opens a new window, such as with a `target="_blank"` link
@@ -986,7 +1130,7 @@ impl Browser {
     fn navigate(&self, url: Url) {
         if let Some(tab) = self.active_tab() {
             tab.stand_in.replace(None);
-            tab.webview.load_uri(url.as_str());
+            tab.load_for_user(url.as_str());
             tab.webview.grab_focus();
         }
     }
@@ -1090,13 +1234,15 @@ impl Browser {
         };
 
         add_action("back", |browser| {
-            if let Some(webview) = browser.webview() {
-                webview.go_back();
+            if let Some(tab) = browser.active_tab() {
+                tab.user_history.set(true);
+                tab.webview.go_back();
             }
         });
         add_action("forward", |browser| {
-            if let Some(webview) = browser.webview() {
-                webview.go_forward();
+            if let Some(tab) = browser.active_tab() {
+                tab.user_history.set(true);
+                tab.webview.go_forward();
             }
         });
         add_action("reload", |browser| {
@@ -1530,6 +1676,7 @@ impl Browser {
             .await;
             let Ok((converted, mut statuses)) = converted else {
                 if let Some(browser) = current_browser() {
+                    browser.filters_loaded.set(true);
                     browser.load_start_page();
                 }
                 return;
@@ -1586,26 +1733,136 @@ impl Browser {
             }
             browser.show_user_filters_status();
             browser.update_filter_button();
+            browser.filters_loaded.set(true);
             browser.load_start_page();
         });
     }
 
-    /// Loads the page that waited for the filters, if it's still there.
+    /// Loads the page that waited for the filters, if it's still there, once
+    /// they and the local network rules are ready.
     fn load_start_page(&self) {
+        if !self.filters_loaded.get() || self.local_filter.borrow().is_none() {
+            return;
+        }
         let Some((id, url)) = self.start_page.take() else {
             return;
         };
         if let Some(tab) = self.tab(id) {
             if tab.webview.uri().is_none() {
-                tab.webview.load_uri(url.as_str());
+                tab.load_for_user(url.as_str());
             }
         }
+    }
+
+    /// Decides whether a tab can go to a local address, which only the user, or
+    /// a page on the same host and port, can open. Returns whether it decided.
+    fn decide_local_navigation(
+        &self,
+        id: TabId,
+        decision: &webkit::NavigationPolicyDecision,
+        action: &webkit::NavigationAction,
+    ) -> bool {
+        let Some(tab) = self.tab(id) else {
+            return false;
+        };
+        let target = action
+            .request()
+            .and_then(|request| request.uri())
+            .and_then(|url| Url::parse(&url).ok());
+        let Some(target) = target else {
+            return false;
+        };
+        let Some(origin) = LocalOrigin::of(&target) else {
+            return false;
+        };
+        let kind = action.navigation_type();
+        let user_asked = tab.take_user_navigation(&target, kind);
+        let opener = tab
+            .opener
+            .and_then(|opener| self.tab(opener))
+            .and_then(|opener| opener.committed.borrow().clone());
+        let from = [tab.committed.borrow().clone(), opener];
+        if !local_network::may_navigate(&target, user_asked, &from) {
+            decision.ignore();
+            // WebKit doesn't say whether it's for the whole tab or a frame in
+            // it, so the tab only says so when the user followed a link or
+            // sent a form, and would expect something to happen, or when it
+            // has no page yet. Pages trying it themselves are just refused.
+            let followed = action.is_user_gesture()
+                && matches!(
+                    kind,
+                    webkit::NavigationType::LinkClicked | webkit::NavigationType::FormSubmitted
+                );
+            if followed || tab.committed.borrow().is_none() {
+                let from = from
+                    .iter()
+                    .flatten()
+                    .next()
+                    .map_or_else(|| "another address".to_owned(), |url| url.origin().ascii_serialization());
+                tab.show_stand_in(target.to_string(), StandInReason::LocalNetwork(from));
+            }
+            return true;
+        }
+        if self.local_origins.borrow().contains(&origin) {
+            return false;
+        }
+        // The rules must allow it before WebKit loads it.
+        let decision = decision.clone();
+        self.compile_local_filter(Some((origin, Box::new(move || decision.use_()))));
+        true
+    }
+
+    /// Compiles the local network rules, with `adding` allowed too, if given,
+    /// and then gives them to every tab, and calls its function.
+    fn compile_local_filter(&self, adding: Option<(LocalOrigin, Box<dyn FnOnce()>)>) {
+        let (then, origins) = {
+            let mut origins = self.local_origins.borrow_mut();
+            let then = adding.map(|(origin, then)| {
+                if !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+                then
+            });
+            (then, origins.clone())
+        };
+        let generation = self.local_generation.get() + 1;
+        self.local_generation.set(generation);
+        let store = self.filter_store.clone();
+        let rules = glib::Bytes::from_owned(local_network::rules(&origins).into_bytes());
+        glib::spawn_future_local(async move {
+            let compiled = store.save_future(local_network::FILTER_ID, &rules).await;
+            let Some(browser) = current_browser() else {
+                return;
+            };
+            match compiled {
+                Ok(filter) => {
+                    if browser.local_generation.get() == generation {
+                        browser.local_filter.replace(Some(filter));
+                        for tab in browser.tabs.borrow().iter() {
+                            browser.apply_filters(tab);
+                        }
+                    }
+                }
+                Err(error) => {
+                    // Carrying on would let pages reach local addresses.
+                    eprintln!("Could not compile the local network rules: {error}");
+                    std::process::exit(1);
+                }
+            }
+            if let Some(then) = then {
+                then();
+            }
+            browser.load_start_page();
+        });
     }
 
     /// Gives a tab the filters in use, or none if it isn't filtered. They apply
     /// from the next page it loads.
     fn apply_filters(&self, tab: &Tab) {
         tab.content.remove_all_filters();
+        if let Some(filter) = self.local_filter.borrow().as_ref() {
+            tab.content.add_filter(filter);
+        }
         if tab.filtering.get() {
             for filter in self.filters.borrow().iter() {
                 tab.content.add_filter(filter);
