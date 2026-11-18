@@ -1035,6 +1035,12 @@ impl Browser {
             return;
         }
         self.tabs.borrow_mut().retain(|other| other.id != id);
+        // Ends the page now, such as a video playing in it, rather than only
+        // once nothing refers to its view any more. Muting silences it at
+        // once, and the blank page replaces it, stopping its sound and scripts.
+        tab.webview.set_is_muted(true);
+        tab.webview.stop_loading();
+        tab.webview.load_uri("about:blank");
         // This makes another tab active, if this one was.
         self.widgets.tabs.detach_tab(&tab.placeholder);
         // Which also ends the page, once nothing else refers to its view.
