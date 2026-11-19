@@ -7,6 +7,8 @@ Created by [AI Sloperator](https://www.aisloperator.com/) with Claude Code.
 
 Portions Copyright.  No license is given.
 
+![BrowseGoo showing the Wikipedia article on WebKit, with tabs for GTK and Rust](screenshot.png)
+
 ## Features
 
 - A browser window with a location field, and back, forward and reload.
