@@ -18,7 +18,7 @@ const SAFARI_VERSION: &str = "60.5";
 /// say Windows 10 there, which Windows 11 is to them, and Chrome gives only
 /// its major version.
 const CHROME: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                      (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+                      (KHTML, like Gecko) Chrome/159.0.0.0 Safari/537.36";
 const FIREFOX: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:160.0) Gecko/20100101 Firefox/160.0";
 
@@ -159,7 +159,7 @@ mod tests {
             Choice::Chrome
                 .value(WEBKIT)
                 .unwrap()
-                .contains("Chrome/157.0.0.0 Safari/537.36")
+                .contains("Chrome/159.0.0.0 Safari/537.36")
         );
         assert!(
             Choice::Firefox
