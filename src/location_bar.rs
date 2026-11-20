@@ -116,7 +116,9 @@ impl LocationBar {
                     | gdk::ModifierType::SHIFT_MASK,
             );
             match key {
-                gdk::Key::Tab if plain && bar.accept_completion() => glib::Propagation::Stop,
+                gdk::Key::Tab if plain && (bar.accept_completion() || bar.accept_suggestion()) => {
+                    glib::Propagation::Stop
+                }
                 gdk::Key::Down | gdk::Key::KP_Down if bar.popover.is_visible() => {
                     bar.move_selection(1);
                     glib::Propagation::Stop
@@ -210,6 +212,26 @@ impl LocationBar {
             self.typed.replace(text.to_string());
         }
         has_completion
+    }
+
+    /// Fills in the address of the selected suggestion, or else the first, such
+    /// as one listed because its title matched, when no address was filled in.
+    fn accept_suggestion(&self) -> bool {
+        if !self.popover.is_visible() {
+            return false;
+        }
+        let index = self.list.selected_row().map_or(0, |row| row.index().max(0));
+        let url = self
+            .suggestions
+            .borrow()
+            .get(index as usize)
+            .map(|bookmark| bookmark.url.clone());
+        let Some(url) = url else {
+            return false;
+        };
+        self.set_text(&url);
+        self.entry.set_position(-1);
+        true
     }
 
     fn show_suggestions(&self, suggestions: Vec<Bookmark>) {

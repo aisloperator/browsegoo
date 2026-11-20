@@ -21,27 +21,27 @@ use url::Url;
 use webkit::prelude::*;
 
 use crate::VERSION;
+use crate::block_sites;
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::bookmarks_editor::{BookmarksEditor, Edit};
-use crate::block_sites;
 use crate::closing;
 use crate::decorations;
 use crate::filter::BlockedSites;
-use crate::find_bar::FindBar;
 use crate::filter_lists::{self, FilterList, LISTS, ListStatus};
-use crate::location::parse_location;
+use crate::find_bar::FindBar;
 use crate::local_network::{self, LocalOrigin};
+use crate::location::parse_location;
 use crate::location_bar::LocationBar;
 use crate::page_fonts;
 use crate::password_manager::PasswordManager;
 use crate::password_prompts::{self, PageMessage};
 use crate::passwords::{self, Passwords};
 use crate::preferences::PreferencesWindow;
-use crate::privacy;
 use crate::preserved::Preserved;
+use crate::privacy;
 use crate::site_data::{self, SiteDataWindow};
-use crate::user_agent;
 use crate::socks_proxy::SocksProxy;
+use crate::user_agent;
 use crate::user_filters::UserFiltersWindow;
 
 const INITIAL_WIDTH: i32 = 1024;
@@ -156,7 +156,10 @@ fn current_browser() -> Option<Rc<Browser>> {
 
 /// WebKit's default User-Agent.
 fn webkit_user_agent() -> String {
-    webkit::Settings::new().user_agent().map(String::from).unwrap_or_default()
+    webkit::Settings::new()
+        .user_agent()
+        .map(String::from)
+        .unwrap_or_default()
 }
 
 /// BrowseGoo's own User-Agent, for its own requests.
@@ -329,7 +332,6 @@ impl Tab {
         self.webview.load_alternate_html(&html, "about:blank", None);
     }
 
-
     /// How far the page has loaded, for the location field, which shows
     /// nothing once it's done.
     fn progress(&self) -> f64 {
@@ -415,10 +417,8 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page
         context.add_path_to_sandbox(page_fonts::config_dir(&dirs.cache), true);
     }
 
-    let network_session = webkit::NetworkSession::new(
-        dirs.data.to_str(),
-        dirs.cache.join("web").to_str(),
-    );
+    let network_session =
+        webkit::NetworkSession::new(dirs.data.to_str(), dirs.cache.join("web").to_str());
     // Every connection goes through it, including to local addresses.
     let proxy = SocksProxy::start().unwrap_or_else(|error| {
         // Carrying on would let public names reach local addresses.
@@ -434,8 +434,8 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page
             cookies.set_persistent_storage(path, webkit::CookiePersistentStorage::Sqlite);
         }
     }
-    let preserved = Preserved::load(dirs.config.join("preserved_site_data.tsv"))
-        .unwrap_or_else(|error| {
+    let preserved =
+        Preserved::load(dirs.config.join("preserved_site_data.tsv")).unwrap_or_else(|error| {
             // Carrying on would delete what was meant to be preserved.
             eprintln!("Could not read which site data to preserve: {error}");
             std::process::exit(1);
@@ -453,7 +453,15 @@ pub fn open(app: &gtk::Application, dirs: Dirs, start_url: Url, page_fonts: page
         ) {
             site_data::delete_unpreserved(&cookies, &data, &preserved).await;
         }
-        open_window(&app, dirs, start_url, network_session, preserved, page_fonts, proxy);
+        open_window(
+            &app,
+            dirs,
+            start_url,
+            network_session,
+            preserved,
+            page_fonts,
+            proxy,
+        );
         drop(hold);
     });
 }
@@ -948,7 +956,8 @@ impl Browser {
             }
             let refused = current_browser().is_some_and(|browser| {
                 Url::parse(url).ok().is_some_and(|url| {
-                    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+                    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default())
+                    else {
                         return false;
                     };
                     browser.proxy.refused(host, port)
@@ -1071,7 +1080,10 @@ impl Browser {
         self.widgets
             .location
             .set_progress_fraction(active.progress());
-        self.set_history_available(active.webview.can_go_back(), active.webview.can_go_forward());
+        self.set_history_available(
+            active.webview.can_go_back(),
+            active.webview.can_go_forward(),
+        );
         self.update_bookmark_button();
         self.update_filter_button();
         self.update_save_password_button();
@@ -1276,13 +1288,15 @@ impl Browser {
             }
         });
 
-        widgets.window.connect_close_request(|_| match current_browser() {
-            Some(browser) => {
-                browser.quit();
-                glib::Propagation::Stop
-            }
-            None => glib::Propagation::Proceed,
-        });
+        widgets
+            .window
+            .connect_close_request(|_| match current_browser() {
+                Some(browser) => {
+                    browser.quit();
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            });
     }
 
     fn connect_actions(self: &Rc<Self>, app: &gtk::Application) {
@@ -1431,8 +1445,8 @@ impl Browser {
 
     fn show_user_filters(&self) {
         if self.user_filters.borrow().is_none() {
-            let rules = filter_lists::load_user_rules(&self.dirs.config)
-                .map_err(|error| error.to_string());
+            let rules =
+                filter_lists::load_user_rules(&self.dirs.config).map_err(|error| error.to_string());
             let window = UserFiltersWindow::new(&self.widgets.window, rules, |text| {
                 let Some(browser) = current_browser() else {
                     return Ok(());
@@ -1499,7 +1513,10 @@ impl Browser {
         glib::spawn_future_local(async move {
             if let (Some(cookies), Some(data)) = (cookies, data) {
                 let deleting = site_data::delete_unpreserved(&cookies, &data, &preserved);
-                if glib::future_with_timeout(DELETING_TIME_LIMIT, deleting).await.is_err() {
+                if glib::future_with_timeout(DELETING_TIME_LIMIT, deleting)
+                    .await
+                    .is_err()
+                {
                     eprintln!("Quitting before all the site data that isn't preserved was deleted");
                 }
             }
@@ -1618,8 +1635,17 @@ impl Browser {
             return;
         };
         match message {
-            PageMessage::Entered { host, username, password } => {
-                if host != domain || self.passwords.borrow().contains(&domain, &username, &password) {
+            PageMessage::Entered {
+                host,
+                username,
+                password,
+            } => {
+                if host != domain
+                    || self
+                        .passwords
+                        .borrow()
+                        .contains(&domain, &username, &password)
+                {
                     return;
                 }
                 tab.entered_password.replace(Some(EnteredPassword {
@@ -1651,7 +1677,8 @@ impl Browser {
 
     /// Fills in the saved password that was chosen from the menu in a tab.
     fn fill_password(&self, id: TabId, record: passwords::RecordId) {
-        let (Some(tab), Some(record)) = (self.tab(id), self.passwords.borrow().get(record).cloned())
+        let (Some(tab), Some(record)) =
+            (self.tab(id), self.passwords.borrow().get(record).cloned())
         else {
             return;
         };
@@ -1667,9 +1694,12 @@ impl Browser {
     }
 
     fn update_save_password_button(&self) {
-        let entered = self
-            .active_tab()
-            .and_then(|tab| tab.entered_password.borrow().as_ref().map(|entered| entered.domain.clone()));
+        let entered = self.active_tab().and_then(|tab| {
+            tab.entered_password
+                .borrow()
+                .as_ref()
+                .map(|entered| entered.domain.clone())
+        });
         let button = &self.widgets.save_password;
         if let Some(domain) = &entered {
             button.set_tooltip_text(Some(&format!("Save the password entered on {domain}")));
@@ -1680,7 +1710,10 @@ impl Browser {
     /// Asks whether to save the password entered in the active tab, which is
     /// then no longer offered, whether it's saved or not.
     fn ask_to_save_password(&self) {
-        let Some(entered) = self.active_tab().and_then(|tab| tab.entered_password.take()) else {
+        let Some(entered) = self
+            .active_tab()
+            .and_then(|tab| tab.entered_password.take())
+        else {
             return;
         };
         self.update_save_password_button();
@@ -1694,7 +1727,10 @@ impl Browser {
                 let Some(browser) = current_browser() else {
                     return Ok(());
                 };
-                let added = browser.passwords.borrow_mut().add(&domain, username, password);
+                let added = browser
+                    .passwords
+                    .borrow_mut()
+                    .add(&domain, username, password);
                 added.map_err(|error| format!("Could not save the password: {error}"))?;
                 browser.passwords_changed();
                 Ok(())
@@ -1729,8 +1765,8 @@ impl Browser {
     /// The active tab's page, as a bookmark of it would be.
     fn current_page(&self) -> Option<Bookmark> {
         let page = self.active_tab()?.page()?;
-        let is_web_page = Url::parse(&page.url)
-            .is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
+        let is_web_page =
+            Url::parse(&page.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"));
         is_web_page.then_some(page)
     }
 
@@ -1796,7 +1832,8 @@ impl Browser {
         let store = self.filter_store.clone();
         glib::spawn_future_local(async move {
             let is_current = || {
-                current_browser().is_some_and(|browser| browser.filter_generation.get() == generation)
+                current_browser()
+                    .is_some_and(|browser| browser.filter_generation.get() == generation)
             };
             let directory = cache_dir.clone();
             let converted = gio::spawn_blocking(move || {
@@ -1926,11 +1963,10 @@ impl Browser {
                     webkit::NavigationType::LinkClicked | webkit::NavigationType::FormSubmitted
                 );
             if followed || tab.committed.borrow().is_none() {
-                let from = from
-                    .iter()
-                    .flatten()
-                    .next()
-                    .map_or_else(|| "another address".to_owned(), |url| url.origin().ascii_serialization());
+                let from = from.iter().flatten().next().map_or_else(
+                    || "another address".to_owned(),
+                    |url| url.origin().ascii_serialization(),
+                );
                 tab.show_stand_in(target.to_string(), StandInReason::LocalNetwork(from));
             }
             return true;
@@ -2109,8 +2145,7 @@ impl Browser {
         if self.updating_lists.replace(true) {
             return;
         }
-        self.list_download_state
-            .replace((true, doing.to_owned()));
+        self.list_download_state.replace((true, doing.to_owned()));
         if let Some(preferences) = self.preferences.borrow().as_ref() {
             preferences.show_update_state(true, doing);
         }
@@ -2159,7 +2194,9 @@ impl Browser {
                     }
                 }
             };
-            browser.list_download_state.replace((false, message.clone()));
+            browser
+                .list_download_state
+                .replace((false, message.clone()));
             if let Some(preferences) = browser.preferences.borrow().as_ref() {
                 preferences.show_update_state(false, &message);
             }
@@ -2221,4 +2258,3 @@ fn close_tab_by_id(id: TabId) {
         browser.close_tab(id);
     }
 }
-

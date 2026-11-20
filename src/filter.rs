@@ -279,7 +279,10 @@ impl BlockedSites {
     /// Whether everything from `host` is blocked. A leading dot, as in a
     /// cookie's domain, is ignored.
     pub fn blocks(&self, host: &str) -> bool {
-        let host = host.trim_start_matches('.').trim_end_matches('.').to_ascii_lowercase();
+        let host = host
+            .trim_start_matches('.')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         if host.is_empty() {
             return false;
         }
@@ -681,7 +684,8 @@ mod tests {
 
     #[test]
     fn wildcards_anchors_and_escaping() {
-        let rules = converted("/banner/*/ad_$image\n|https://track.$image\n.gif|$image\n*/a+b?(c)$image");
+        let rules =
+            converted("/banner/*/ad_$image\n|https://track.$image\n.gif|$image\n*/a+b?(c)$image");
         assert!(rules[0].contains(r#""url-filter":"/banner/.*/ad_""#));
         assert!(rules[1].contains(r#""url-filter":"^https://track\\.""#));
         assert!(rules[2].contains(r#""url-filter":"\\.gif$""#));
@@ -693,7 +697,9 @@ mod tests {
         let rules = converted("-advert-");
         assert_eq!(rules.len(), 2);
         assert!(rules[0].contains(DEFAULT_TYPES_JSON));
-        assert!(rules[1].contains(r#""resource-type":["document"],"load-context":["child-frame"]"#));
+        assert!(
+            rules[1].contains(r#""resource-type":["document"],"load-context":["child-frame"]"#)
+        );
     }
 
     #[test]
@@ -804,7 +810,9 @@ mod tests {
 
     #[test]
     fn sites_blocked_entirely() {
-        let sites = blocked(&["||tracker.example^\n||ads.site.example^\n||cdn.example\n||all.example^$all"]);
+        let sites = blocked(&[
+            "||tracker.example^\n||ads.site.example^\n||cdn.example\n||all.example^$all",
+        ]);
         for host in [
             "tracker.example",
             ".tracker.example",
@@ -818,7 +826,14 @@ mod tests {
             assert!(sites.blocks(host), "{host}");
         }
         // Only a subdomain of it is blocked, or a different site.
-        for host in ["site.example", ".site.example", "example", "tracker.example.org", "xtracker.example", ""] {
+        for host in [
+            "site.example",
+            ".site.example",
+            "example",
+            "tracker.example.org",
+            "xtracker.example",
+            "",
+        ] {
             assert!(!sites.blocks(host), "{host}");
         }
     }
@@ -831,8 +846,15 @@ mod tests {
              ||h.example^$document\n||i.example^$~image",
         ]);
         for host in [
-            "a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example",
-            "h.example", "i.example",
+            "a.example",
+            "b.example",
+            "c.example",
+            "d.example",
+            "e.example",
+            "f.example",
+            "g.example",
+            "h.example",
+            "i.example",
         ] {
             assert!(!sites.blocks(host), "{host}");
         }
@@ -840,14 +862,12 @@ mod tests {
 
     #[test]
     fn exceptions_unblock_sites_except_for_important_rules() {
-        let sites = blocked(&[
-            "||a.example^\n@@||a.example/ok.js\n\
+        let sites = blocked(&["||a.example^\n@@||a.example/ok.js\n\
              ||b.example^\n@@||cdn.b.example^$script\n\
              ||c.example^$important\n@@||c.example^\n\
              ||d.example^\n@@|https://www.d.example/\n\
              ||e.example^\n@@/ads.js\n@@*e.example\n@@||site.example^$document\n\
-             ||f.example^\n@@||sub*.f.example^",
-        ]);
+             ||f.example^\n@@||sub*.f.example^"]);
         assert!(!sites.blocks("a.example"));
         assert!(!sites.blocks("x.a.example"));
         // Its data is sent to the subdomain that's let through.

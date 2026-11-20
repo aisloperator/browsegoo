@@ -261,7 +261,8 @@ mod tests {
         assert!(describe_lines_not_applied(&[3, 5]).starts_with(" Lines 3, 5 aren't"));
         let many: Vec<usize> = (1..=12).collect();
         assert!(
-            describe_lines_not_applied(&many).starts_with(" Lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more")
+            describe_lines_not_applied(&many)
+                .starts_with(" Lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 and 2 more")
         );
     }
 }

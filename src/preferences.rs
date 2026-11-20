@@ -89,7 +89,10 @@ impl PreferencesWindow {
         let user_agent_choices = gtk::DropDown::from_strings(&labels);
         user_agent_choices.set_halign(gtk::Align::Start);
         user_agent_choices.set_selected(
-            Choice::ALL.iter().position(|&choice| choice == user_agent).unwrap_or(0) as u32,
+            Choice::ALL
+                .iter()
+                .position(|&choice| choice == user_agent)
+                .unwrap_or(0) as u32,
         );
         content.append(&user_agent_choices);
         content.append(&explain(

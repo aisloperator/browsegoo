@@ -100,7 +100,13 @@ impl Entry {
             Some(time) => format_time(&time),
             None => "When BrowseGoo quits".to_owned(),
         };
-        let yes_no = |yes: bool, text: &str| if yes { text.to_owned() } else { "No".to_owned() };
+        let yes_no = |yes: bool, text: &str| {
+            if yes {
+                text.to_owned()
+            } else {
+                "No".to_owned()
+            }
+        };
         let same_site = match cookie.same_site_policy() {
             soup::SameSitePolicy::Strict => "Strict, only sent from the same site",
             soup::SameSitePolicy::Lax => "Lax, also sent when following a link from another site",
@@ -111,8 +117,14 @@ impl Entry {
             ("Sent to", sent_to),
             ("Path", path),
             ("Expires", expires),
-            ("Secure", yes_no(cookie.is_secure(), "Yes, only sent over HTTPS")),
-            ("HTTP only", yes_no(cookie.is_http_only(), "Yes, hidden from scripts")),
+            (
+                "Secure",
+                yes_no(cookie.is_secure(), "Yes, only sent over HTTPS"),
+            ),
+            (
+                "HTTP only",
+                yes_no(cookie.is_http_only(), "Yes, hidden from scripts"),
+            ),
             ("SameSite", same_site.to_owned()),
         ];
         Self {
@@ -135,9 +147,20 @@ impl Entry {
             .filter(|(kind, _)| types.contains(*kind))
             .map(|&(kind, kind_name)| {
                 let size = data.size(kind);
-                let value = if size > 0 { format_size(size) } else { String::new() };
+                let value = if size > 0 {
+                    format_size(size)
+                } else {
+                    String::new()
+                };
                 let details = vec![
-                    ("Size", if size > 0 { value.clone() } else { "Not known".to_owned() }),
+                    (
+                        "Size",
+                        if size > 0 {
+                            value.clone()
+                        } else {
+                            "Not known".to_owned()
+                        },
+                    ),
                     (
                         "Deleting",
                         format!("Removes all of this site's {}", kind_name.to_lowercase()),
@@ -285,7 +308,11 @@ fn sort_text(text: &str) -> String {
 fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 3] = ["KB", "MB", "GB"];
     if bytes < 1024 {
-        return if bytes == 1 { "1 byte".to_owned() } else { format!("{bytes} bytes") };
+        return if bytes == 1 {
+            "1 byte".to_owned()
+        } else {
+            format!("{bytes} bytes")
+        };
     }
     let mut size = bytes as f64 / 1024.0;
     let mut unit = 0;
@@ -584,9 +611,11 @@ impl SiteDataWindow {
             this.show_details();
             this.show_count();
         });
-        this.selection.connect_selection_changed(move |_, _, _| changed());
+        this.selection
+            .connect_selection_changed(move |_, _, _| changed());
         let changed = with(|this| this.show_count());
-        this.selection.connect_items_changed(move |_, _, _, _| changed());
+        this.selection
+            .connect_items_changed(move |_, _, _, _| changed());
 
         let refresh_now = with(Self::refresh);
         refresh.connect_clicked(move |_| refresh_now());
@@ -760,7 +789,8 @@ impl SiteDataWindow {
             text.push_str(&format!(", {selected} selected"));
         }
         self.count.set_text(&text);
-        self.delete.set_sensitive(selected > 0 && !self.deleting.get());
+        self.delete
+            .set_sensitive(selected > 0 && !self.deleting.get());
         self.cleanup.set_sensitive(!self.deleting.get());
         self.block.set_sensitive(selected > 0);
     }
@@ -781,7 +811,10 @@ impl SiteDataWindow {
             return;
         };
         let entry = entry_of(object);
-        let mut rows = vec![("Site", entry.host.clone()), ("Type", entry.kind.to_owned())];
+        let mut rows = vec![
+            ("Site", entry.host.clone()),
+            ("Type", entry.kind.to_owned()),
+        ];
         if !entry.name.is_empty() {
             rows.push(("Name", entry.name.clone()));
         }
@@ -826,9 +859,11 @@ impl SiteDataWindow {
             .map(|object| entry_of(object).host.clone())
             .collect();
         let add_rules = self.add_rules.clone();
-        block_sites::show(&self.window, hosts.iter().map(String::as_str), move |rules| {
-            add_rules(rules)
-        });
+        block_sites::show(
+            &self.window,
+            hosts.iter().map(String::as_str),
+            move |rules| add_rules(rules),
+        );
     }
 
     /// Deletes everything that isn't preserved, as quitting does, once the
@@ -881,7 +916,9 @@ impl SiteDataWindow {
             for object in selected {
                 let result = match &entry_of(&object).source {
                     Source::Cookie(cookie) => cookies.delete_cookie_future(cookie).await,
-                    Source::Stored(site, kind) => remove_data(&data, std::slice::from_ref(site), *kind).await,
+                    Source::Stored(site, kind) => {
+                        remove_data(&data, std::slice::from_ref(site), *kind).await
+                    }
                 };
                 if let Err(error) = result {
                     eprintln!("Could not delete {}: {error}", entry_of(&object).key());
@@ -1065,7 +1102,8 @@ fn add_column(
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
-        if let (Some(object), Some(label)) = (item.item(), item.child().and_downcast::<gtk::Label>())
+        if let (Some(object), Some(label)) =
+            (item.item(), item.child().and_downcast::<gtk::Label>())
         {
             show_text(&label, &text(&entry_of(&object)));
             entry_mut(&object).labels.push((label.downgrade(), text));
@@ -1075,7 +1113,8 @@ fn add_column(
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
             return;
         };
-        if let (Some(object), Some(label)) = (item.item(), item.child().and_downcast::<gtk::Label>())
+        if let (Some(object), Some(label)) =
+            (item.item(), item.child().and_downcast::<gtk::Label>())
         {
             entry_mut(&object)
                 .labels
@@ -1108,14 +1147,18 @@ mod tests {
     fn long_values_are_left_out_of_the_list() {
         assert_eq!(listed_value("abc"), "abc");
         let long = "x".repeat(LONGEST_LISTED_VALUE + 1);
-        assert_eq!(listed_value(&long), format!("({} characters)", LONGEST_LISTED_VALUE + 1));
+        assert_eq!(
+            listed_value(&long),
+            format!("({} characters)", LONGEST_LISTED_VALUE + 1)
+        );
         let fits = "é".repeat(LONGEST_LISTED_VALUE);
         assert_eq!(listed_value(&fits), fits);
     }
 
     #[test]
     fn filtering_by_site_or_name() {
-        let entry = Entry::from_cookie(soup::Cookie::new("SessionID", "1", ".Example.com", "/", 60));
+        let entry =
+            Entry::from_cookie(soup::Cookie::new("SessionID", "1", ".Example.com", "/", 60));
         assert!(entry.matches("example", false));
         assert!(!entry.matches("session", false));
         assert!(entry.matches("session", true));
@@ -1172,23 +1215,50 @@ mod tests {
         // From nothing, and to nothing.
         assert_eq!(
             changes_between(&[], &old).spliced,
-            [Splice { position: 0, removed: 0, added: 0..5 }]
+            [Splice {
+                position: 0,
+                removed: 0,
+                added: 0..5
+            }]
         );
         assert_eq!(
             changes_between(&old, &[]).spliced,
-            [Splice { position: 0, removed: 5, added: 0..0 }]
+            [Splice {
+                position: 0,
+                removed: 5,
+                added: 0..0
+            }]
         );
         // "a" is removed, "c" changes, "cc" is added, and "f" is added.
-        let new = rows(&[("b", "1"), ("c", "2"), ("cc", "1"), ("d", "1"), ("e", "1"), ("f", "1")]);
+        let new = rows(&[
+            ("b", "1"),
+            ("c", "2"),
+            ("cc", "1"),
+            ("d", "1"),
+            ("e", "1"),
+            ("f", "1"),
+        ]);
         let changes = changes_between(&old, &new);
         assert_eq!(
             changes,
             Changes {
                 changed: vec![(2, 1)],
                 spliced: vec![
-                    Splice { position: 0, removed: 1, added: 0..0 },
-                    Splice { position: 2, removed: 0, added: 2..3 },
-                    Splice { position: 5, removed: 0, added: 5..6 },
+                    Splice {
+                        position: 0,
+                        removed: 1,
+                        added: 0..0
+                    },
+                    Splice {
+                        position: 2,
+                        removed: 0,
+                        added: 2..3
+                    },
+                    Splice {
+                        position: 5,
+                        removed: 0,
+                        added: 5..6
+                    },
                 ],
             }
         );
@@ -1200,7 +1270,14 @@ mod tests {
         let old = rows(&[("a", "1"), ("b", "1"), ("c", "1")]);
         let new = rows(&[("a", "1"), ("c", "1"), ("b", "1")]);
         let changes = changes_between(&old, &new);
-        assert_eq!(changes.spliced, [Splice { position: 1, removed: 2, added: 1..3 }]);
+        assert_eq!(
+            changes.spliced,
+            [Splice {
+                position: 1,
+                removed: 2,
+                added: 1..3
+            }]
+        );
         assert_eq!(changed(&old, &new, changes), new);
     }
 

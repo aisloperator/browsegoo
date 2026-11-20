@@ -64,8 +64,10 @@ mod tests {
     use super::*;
 
     fn temporary_path(name: &str) -> PathBuf {
-        let directory = std::env::temp_dir()
-            .join(format!("browsegoo-test-{}-preserved-{name}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "browsegoo-test-{}-preserved-{name}",
+            std::process::id()
+        ));
         fs::create_dir_all(&directory).unwrap();
         directory.join("preserved_site_data.tsv")
     }

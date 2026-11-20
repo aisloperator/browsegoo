@@ -339,14 +339,21 @@ mod tests {
         assert!(statuses["easyprivacy"].downloaded.is_none());
         assert!(statuses["peter-lowe"].downloaded.is_some());
         assert!(statuses["peter-lowe"].stats.is_none());
-        assert_eq!(statuses[USER_RULES_ID].stats.map(|stats| stats.rules), Some(0));
+        assert_eq!(
+            statuses[USER_RULES_ID].stats.map(|stats| stats.rules),
+            Some(0)
+        );
     }
 
     #[test]
     fn user_rules_are_converted_after_the_lists() {
         let cache = temporary_dir("user-cache");
         let config = temporary_dir("user-config");
-        fs::write(cache_path(&cache, &LISTS[0]), "[Adblock Plus 2.0]\n||a.example^\n").unwrap();
+        fs::write(
+            cache_path(&cache, &LISTS[0]),
+            "[Adblock Plus 2.0]\n||a.example^\n",
+        )
+        .unwrap();
         save_user_rules(&config, "! Mine\n||mine.example^\n@@||a.example^\n").unwrap();
         assert!(load_user_rules(&config).unwrap().contains("mine.example"));
 
@@ -356,7 +363,10 @@ mod tests {
         assert!(!blocked.blocks("a.example"));
         let ids: Vec<_> = converted.iter().map(|converted| converted.id).collect();
         assert_eq!(ids, ["easylist", USER_RULES_ID]);
-        assert_eq!(statuses[USER_RULES_ID].stats.map(|stats| stats.rules), Some(2));
+        assert_eq!(
+            statuses[USER_RULES_ID].stats.map(|stats| stats.rules),
+            Some(2)
+        );
         // The list has the user's exception, but isn't counted with it.
         assert!(converted[0].json.contains("ignore-previous-rules"));
         assert_eq!(statuses["easylist"].stats.map(|stats| stats.rules), Some(1));
