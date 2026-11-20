@@ -43,6 +43,8 @@ pub struct BookmarksEditor {
     open: Box<dyn Fn(&str)>,
     current_page: Box<dyn Fn() -> Option<Bookmark>>,
     items: RefCell<Vec<Bookmark>>,
+    /// The title and address labels of each row of the list.
+    rows: RefCell<Vec<(gtk::Label, gtk::Label)>>,
     /// The bookmark the fields are for.
     editing: Cell<Option<usize>>,
     /// Where a new bookmark goes, while the fields are for one.
@@ -164,6 +166,7 @@ impl BookmarksEditor {
             open: Box::new(open),
             current_page: Box::new(current_page),
             items: RefCell::new(Vec::new()),
+            rows: RefCell::new(Vec::new()),
             editing: Cell::new(None),
             adding: Cell::new(None),
             select_next: Cell::new(None),
@@ -265,16 +268,23 @@ impl BookmarksEditor {
             .map(|index| index.min(items.len().saturating_sub(1)));
         self.items.replace(items.to_vec());
 
+        // Rows are updated in place, rather than all replaced, as a change can
+        // be made while a row is being clicked, when leaving a field saves it.
+        // Destroying the clicked row then hangs GTK (issue #37).
         self.loading.set(true);
-        self.list.remove_all();
-        for item in items {
+        let mut rows = self.rows.borrow_mut();
+        while rows.len() > items.len() {
+            rows.pop();
+            if let Some(row) = self.list.row_at_index(rows.len() as i32) {
+                self.list.remove(&row);
+            }
+        }
+        while rows.len() < items.len() {
             let title = gtk::Label::builder()
-                .label(&item.title)
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
             let url = gtk::Label::builder()
-                .label(&item.url)
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::Middle)
                 .css_classes(["dim-label", "caption"])
@@ -290,7 +300,13 @@ impl BookmarksEditor {
             row.append(&title);
             row.append(&url);
             self.list.append(&row);
+            rows.push((title, url));
         }
+        for ((title, url), item) in rows.iter().zip(items) {
+            title.set_label(&item.title);
+            url.set_label(&item.url);
+        }
+        drop(rows);
         self.loading.set(false);
 
         if self.adding.get().is_some() && selected.is_none() {
