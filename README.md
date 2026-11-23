@@ -288,6 +288,136 @@ their patterns escaped. Isolating any more of it would mean moving GTK's own
 drawing and input out of the process that has the window, which isn't
 practical.
 
+## WebKit configuration
+
+BrowseGoo uses WebKitGTK 6.0, through the
+[`webkit6`](https://docs.rs/webkit6/latest/webkit6/) Rust crate, and changes
+few of its choices. The defaults below are those of WebKitGTK 2.54.3, from
+Debian 13, as it reports them when running. The
+[WebKitGTK 6.0 API reference](https://webkitgtk.org/reference/webkitgtk/stable/)
+documents them all.
+
+### For the whole program: `WebContext`
+
+[`WebContext`](https://webkitgtk.org/reference/webkitgtk/stable/class.WebContext.html)
+
+- The web processes' sandbox is always on in WebKitGTK 6.0, which has no way to
+  turn it off. When fonts are limited, BrowseGoo
+  [adds](https://webkitgtk.org/reference/webkitgtk/stable/method.WebContext.add_path_to_sandbox.html)
+  the folder with its fontconfig file to what the sandbox can read, and gives
+  web processes that file through `FONTCONFIG_FILE`. See `src/page_fonts.rs`.
+- The [cache model](https://webkitgtk.org/reference/webkitgtk/stable/method.WebContext.set_cache_model.html)
+  is the default, `WEB_BROWSER`. Spell checking is off, the default.
+
+### Networking and site data: `NetworkSession`
+
+[`NetworkSession`](https://webkitgtk.org/reference/webkitgtk/stable/class.NetworkSession.html)
+
+- The session is persistent, not ephemeral. Site data is in
+  `~/.local/share/browsegoo/`, and the HTTP cache is in
+  `~/.cache/browsegoo/web/`.
+- Instead of the desktop's
+  [proxy settings](https://webkitgtk.org/reference/webkitgtk/stable/method.NetworkSession.set_proxy_settings.html),
+  every connection goes through BrowseGoo's own SOCKS proxy
+  (`src/socks_proxy.rs`), so that public names can't reach local addresses. If
+  the proxy can't start, BrowseGoo doesn't either.
+- Cookies are kept in `cookies.sqlite`, rather than only in memory, which is
+  the default.
+- The [cookie accept policy](https://webkitgtk.org/reference/webkitgtk/stable/method.CookieManager.set_accept_policy.html)
+  is the default, `NO_THIRD_PARTY`, so third-party cookies are refused.
+- [Intelligent Tracking Prevention](https://webkitgtk.org/reference/webkitgtk/stable/method.NetworkSession.set_itp_enabled.html)
+  is off, the default. Instead, BrowseGoo deletes the cookies and site data of
+  every site you haven't chosen to preserve, when it starts and quits, and
+  deletes what blocked sites store as they store it. It does this through the
+  [`CookieManager`](https://webkitgtk.org/reference/webkitgtk/stable/class.CookieManager.html)
+  and [`WebsiteDataManager`](https://webkitgtk.org/reference/webkitgtk/stable/class.WebsiteDataManager.html),
+  in `src/site_data.rs`.
+- The [TLS errors policy](https://webkitgtk.org/reference/webkitgtk/stable/method.NetworkSession.set_tls_errors_policy.html)
+  is the default, `FAIL`. A page with a certificate error doesn't load, and
+  there's no way to load it anyway.
+- Persistent storage of HTTP authentication credentials is on, the default.
+- [Downloads](https://webkitgtk.org/reference/webkitgtk/stable/signal.NetworkSession.download-started.html)
+  are left to WebKit.
+
+### Pages: `Settings`
+
+[`Settings`](https://webkitgtk.org/reference/webkitgtk/stable/class.Settings.html),
+one shared by all tabs. BrowseGoo changes only two:
+
+- `user-agent`, to the one chosen in the preferences (`src/user_agent.rs`).
+- `enable-site-specific-quirks`, which is on by default, is only left on when
+  the User-Agent is WebKit's own, as WebKit's fixes for particular sites would
+  otherwise replace the chosen one on those sites.
+
+The others are WebKit's defaults. Those that matter most for privacy and
+security are:
+
+| Setting | In effect |
+|---|---|
+| `enable-javascript`, `enable-javascript-markup` | on |
+| `javascript-can-open-windows-automatically` | off, so pop-ups need a click or key |
+| `javascript-can-access-clipboard` | off |
+| `enable-html5-local-storage`, `enable-html5-database` | on |
+| `enable-offline-web-application-cache` | off |
+| `enable-page-cache` (the back and forward cache) | on |
+| `enable-hyperlink-auditing` | on, but no longer works, and BrowseGoo removes `ping` attributes itself |
+| `enable-dns-prefetching` | off, and can no longer be turned on |
+| `enable-webrtc` | off |
+| `enable-media-stream` | on, but pages are refused the camera and microphone |
+| `enable-encrypted-media` (DRM) | off |
+| `enable-media`, `enable-mediasource`, `enable-media-capabilities` | on |
+| `media-playback-requires-user-gesture` | off, so media can play by itself |
+| `enable-webgl`, `enable-webaudio`, `enable-2d-canvas-acceleration` | on |
+| `enable-fullscreen` | on |
+| `enable-developer-extras` (the Web Inspector) | off |
+| `allow-file-access-from-file-urls`, `allow-universal-access-from-file-urls` | off |
+| `allow-top-navigation-to-data-urls` | off |
+| `disable-web-security` | off, so the same-origin policy applies |
+| `hardware-acceleration-policy` | `ALWAYS` |
+| `default-charset` | `iso-8859-1` |
+| `default-font-size`, `default-monospace-font-size`, `minimum-font-size` | 16, 13 and 0 pixels |
+
+WebKit also has
+[about 540 feature flags](https://webkitgtk.org/reference/webkitgtk/stable/method.Settings.set_feature_enabled.html),
+for experimental and internal features, which BrowseGoo leaves as they are.
+
+### Content blocking and scripts: `UserContentManager`
+
+[`UserContentManager`](https://webkitgtk.org/reference/webkitgtk/stable/class.UserContentManager.html),
+one for each tab. WebKit adds nothing by default. BrowseGoo adds:
+
+- Content blockers, compiled into a
+  [`UserContentFilterStore`](https://webkitgtk.org/reference/webkitgtk/stable/class.UserContentFilterStore.html)
+  in `~/.cache/browsegoo/`. These are the filter lists that are on, your own
+  rules and blocked sites, and the rules that keep pages from reaching local
+  addresses. The shield button turns off all but the last of these for a tab.
+- [User scripts](https://webkitgtk.org/reference/webkitgtk/stable/struct.UserScript.html),
+  each running apart from the page's own scripts. One removes `ping`
+  attributes, in every frame (`src/privacy.rs`), and one finds login forms for
+  saving passwords, in the top frame (`src/password_prompts.rs`).
+
+### Tabs: `WebView` signals
+
+[`WebView`](https://webkitgtk.org/reference/webkitgtk/stable/class.WebView.html)
+
+- [`decide-policy`](https://webkitgtk.org/reference/webkitgtk/stable/signal.WebView.decide-policy.html):
+  BrowseGoo stops pages from going to local addresses, and opens links in new
+  tabs when middle-clicked or Ctrl+clicked. Whether to show or download a
+  response is left to WebKit.
+- `create`: what would open a new window opens a new tab instead.
+- `load-failed`: BrowseGoo shows its own page for a page that's blocked, or
+  that the proxy refused.
+- `web-process-terminated`: a tab whose web process crashed says so.
+- [`permission-request`](https://webkitgtk.org/reference/webkitgtk/stable/signal.WebView.permission-request.html)
+  isn't handled, so each request gets WebKit's default for its kind. Requests
+  for location, notifications, the camera and microphone, the list of media
+  devices, DRM, the clipboard, and site data while embedded in another site are
+  refused. Locking the mouse pointer is allowed.
+- [`load-failed-with-tls-errors`](https://webkitgtk.org/reference/webkitgtk/stable/signal.WebView.load-failed-with-tls-errors.html),
+  [`authenticate`](https://webkitgtk.org/reference/webkitgtk/stable/signal.WebView.authenticate.html),
+  `script-dialog`, `context-menu` and `run-file-chooser` aren't handled, so
+  WebKit's own behavior and dialogs are used.
+
 ## Known limitations
 
 This is a starting point, and these are not done yet:
