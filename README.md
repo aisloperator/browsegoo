@@ -26,6 +26,9 @@ Portions Copyright.  No license is given.
   title bar, with buttons for minimizing, maximizing and closing as the desktop
   has them set. Setting the environment variable `GTK_CSD` to 1 puts the tabs in
   the title bar on X11 too.
+- A dark or light style that follows the desktop's, through the XDG desktop
+  portal, and changes when the desktop's does. Pages are told it too, through
+  `prefers-color-scheme`, so sites with a dark style use it.
 - HTTP and HTTPS. TLS is done by WebKit, with GnuTLS through GLib, and
   certificates are checked with the system's trusted roots.
 - Finding text in the page as it's typed, in a bar that opens at the bottom of

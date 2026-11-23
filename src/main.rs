@@ -5,6 +5,7 @@ mod bookmarks;
 mod bookmarks_editor;
 mod browser;
 mod closing;
+mod color_scheme;
 mod completion;
 mod decorations;
 mod fetch;
@@ -98,6 +99,7 @@ fn main() -> ExitCode {
         .application_id(APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)
         .build();
+    app.connect_startup(|_| color_scheme::follow_desktop());
     app.connect_activate(move |app| {
         browser::open(app, dirs.clone(), start_url.clone(), page_fonts.clone())
     });
