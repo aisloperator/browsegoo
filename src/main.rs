@@ -7,6 +7,7 @@ mod browser;
 mod closing;
 mod color_scheme;
 mod completion;
+mod debug_stalls;
 mod decorations;
 mod fetch;
 mod filter;
@@ -22,6 +23,7 @@ mod passwords;
 mod preferences;
 mod preserved;
 mod privacy;
+mod scroll_loop;
 mod site_data;
 mod socks_proxy;
 mod user_agent;
@@ -101,6 +103,7 @@ fn main() -> ExitCode {
         .build();
     app.connect_startup(|_| color_scheme::follow_desktop());
     app.connect_activate(move |app| {
+        debug_stalls::start();
         browser::open(app, dirs.clone(), start_url.clone(), page_fonts.clone())
     });
 

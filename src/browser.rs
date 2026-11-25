@@ -821,6 +821,7 @@ impl Browser {
             }
         });
         self.connect_webview(&tab);
+        crate::debug_stalls::watch(id, &tab.webview);
 
         // The tab must be known before the tab strip announces it as active.
         self.tabs.borrow_mut().push(tab.clone());
@@ -1204,6 +1205,8 @@ impl Browser {
     }
 
     fn connect_widgets(self: &Rc<Self>) {
+        crate::debug_stalls::watch_scrolling(&self.widgets.window);
+        crate::scroll_loop::guard(&self.widgets.window);
         let widgets = &self.widgets;
 
         if let Some(cookies) = self.network_session.cookie_manager() {

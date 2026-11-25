@@ -262,6 +262,45 @@ depends on, and which a build from source needs installed too:
 `packaging/build-deb.sh` builds the `.deb` in `target/debian/`. It needs
 `dpkg-dev`.
 
+## Debugging hangs
+
+When BrowseGoo or a page stops responding for a while, BrowseGoo can log it and
+capture what its processes were doing. This is off unless the environment
+variable `BROWSEGOO_DEBUG_STALLS` is set to `1`:
+
+    BROWSEGOO_DEBUG_STALLS=1 browsegoo 2> stalls.log
+
+It then logs, to standard error:
+
+- `UI main loop STALLED`, and `resumed after N ms`, when BrowseGoo's own main
+  thread, which handles the window and input, falls more than 300 ms behind.
+- `tab N: script ping took N ms`, when a tab's web process took more than
+  250 ms to run a tiny script. Each tab gets one every 500 ms. Hover effects,
+  clicks and scrolling wait for the same thread. Also
+  `web process responsive = false` and `= true`, as WebKit reports them.
+- Each tab's page loads, and once a second while scrolling, how many scroll
+  events reached the window, how many came again, and the largest delta. A
+  scroll event that keeps coming round again is dropped, and logged as
+  `dropped a scroll event that came round again` (see issue #40).
+
+When the main thread, or a tab's script, has waited for 1000 ms, it captures
+the hang to `browsegoo-debug-hangs-<timestamp>.txt` in the current directory.
+`BROWSEGOO_DEBUG_HANG_MS` sets a different wait in milliseconds. A capture has:
+
+- each thread's CPU use over 300 ms, across BrowseGoo and its WebKit
+  processes;
+- backtraces of BrowseGoo, and of each process using at least 20% of a CPU
+  (or of every web process if none is), taken at the same time;
+- those processes' executable memory maps, from which WebKit's unnamed
+  frames can be named afterwards with the distribution's debug symbols. On
+  Debian, those for security updates of WebKitGTK are in
+  `deb http://deb.debian.org/debian-security-debug trixie-security-debug main`.
+
+Backtraces come from `eu-stack` if it's installed (`sudo apt install
+elfutils`), which takes about half a second, or else from `gdb`, which takes
+about one and a half. There's at most one capture every 8 seconds, and 30 in a
+run.
+
 ## Process isolation
 
 BrowseGoo's own code is Rust, but WebKit, GTK and the libraries they use are C
